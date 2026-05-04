@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Job Scoring Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <link rel="stylesheet" href="css/styles.css">
+
+  <script type="importmap">
+  {
+    "imports": {
+      "firebase/app":  "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js",
+      "firebase/auth": "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js"
+    }
+  }
+  </script>
+</head>
+
+<body>
+
+  <!-- ================================================================ -->
+  <!-- Header -->
+  <!-- ================================================================ -->
+
+  <header class="app-header">
+    <h1>Job Scoring Dashboard</h1>
+
+    <div class="actions">
+      <span id="auto-refresh-indicator" class="hidden">
+        <span class="spinner"></span>
+        <span id="auto-refresh-text"></span>
+      </span>
+      <button id="btn-refresh" type="button">Refresh</button>
+      <button id="btn-new-job">Score New Job</button>
+      <button id="btn-manage-resumes">Manage Resumes</button>
+      <button id="btn-sign-in" type="button">Sign In</button>
+      <button id="btn-sign-out" type="button" class="hidden">Sign Out</button>
+    </div>
+  </header>
+
+  <!-- ================================================================ -->
+  <!-- Jobs Table -->
+  <!-- ================================================================ -->
+
+  <main>
+
+    <table id="jobs-table">
+      <thead>
+        <tr>
+          <th data-sort="job_title">Job Title</th>
+          <th data-sort="company">Company</th>
+          <th data-sort="status">Status</th>
+          <th data-sort="score">Score</th>
+          <th data-sort="created_at">Date</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+
+      <tbody id="jobs-body">
+        <!-- rows rendered by jobs.js -->
+      </tbody>
+
+    </table>
+
+    <div id="empty-state" class="hidden">
+      <p>No jobs submitted yet.</p>
+      <p>Click <b>Score New Job</b> to begin.</p>
+    </div>
+
+  </main>
+
+<!-- ================================================================ -->
+<!-- New Job Modal -->
+<!-- ================================================================ -->
+
+<div id="new-job-modal" class="modal hidden">
+
+  <div class="modal-content">
+
+    <h2>Score New Job</h2>
+
+    <form id="new-job-form">
+
+      <label>Resume</label>
+      <select id="resume-select"></select>
+      <div id="resume-error" class="field-error hidden"></div>
+
+      <label>Source Type</label>
+      <select id="source-type">
+        <option value="url">Job URL</option>
+        <option value="raw_text">Paste Job Description</option>
+        <option value="linkedin_job_id">LinkedIn Job IDs</option>
+      </select>
+
+      <div id="url-field">
+        <label>Job URL</label>
+        <input type="text" id="job-url">
+        <div id="job-url-error" class="field-error hidden"></div>
+      </div>
+
+      <div id="text-field" class="hidden">
+        <label>Job Description</label>
+        <textarea id="job-description"></textarea>
+        <div id="job-description-error" class="field-error hidden"></div>
+      </div>
+
+      <div id="linkedin-field" class="hidden">
+        <label>LinkedIn Job ID(s)</label>
+        <textarea
+          id="linkedin-job-ids"
+          placeholder="Enter one or more LinkedIn job IDs&#10;Example:&#10;1234567890&#10;9876543210"
+        ></textarea>
+        <div id="linkedin-job-ids-error" class="field-error hidden"></div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="submit" id="submit-new-job">Submit</button>
+        <button type="button" id="cancel-new-job">Cancel</button>
+      </div>
+
+    </form>
+
+  </div>
+
+</div>
+
+  <!-- ================================================================ -->
+  <!-- Resume Manager Modal -->
+  <!-- ================================================================ -->
+
+  <div id="resume-modal" class="modal hidden">
+
+    <div class="modal-content resume-modal-content">
+
+      <h2>Manage Resumes</h2>
+
+      <div class="resume-manager">
+
+        <div class="resume-sidebar">
+
+          <div class="resume-sidebar-actions">
+            <button type="button" id="btn-new-resume">New Resume</button>
+          </div>
+
+          <div id="resume-list"></div>
+
+        </div>
+
+        <div class="resume-editor">
+
+          <h3 id="resume-form-title">Create Resume</h3>
+
+          <form id="resume-form">
+
+            <label>Resume Name</label>
+            <input type="text" id="resume-name">
+
+            <label>Resume Text</label>
+            <textarea id="resume-text"></textarea>
+
+            <div class="modal-actions">
+              <button type="submit" id="save-resume-btn">
+                Create Resume
+              </button>
+              <button
+                type="button"
+                id="delete-resume-btn"
+                class="danger hidden"
+              >
+                Delete
+              </button>
+              <button type="button" id="close-resume-modal">Close</button>
+            </div>
+
+          </form>
+
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- Auth Modal -->
+  <!-- ================================================================ -->
+
+  <div id="auth-modal" class="modal hidden">
+
+    <div class="modal-content">
+
+      <h2 id="auth-modal-title">Sign In</h2>
+
+      <form id="auth-form">
+
+        <label for="auth-email">Email</label>
+        <input
+          type="email"
+          id="auth-email"
+          autocomplete="email"
+          required
+        >
+
+        <label for="auth-password">Password</label>
+        <input
+          type="password"
+          id="auth-password"
+          autocomplete="current-password"
+          required
+        >
+
+        <div id="auth-error" class="field-error hidden"></div>
+
+        <div class="modal-actions">
+          <button type="submit" id="btn-auth-submit">Sign In</button>
+          <button type="button" id="btn-auth-toggle">Create Account</button>
+        </div>
+
+      </form>
+
+    </div>
+
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- Load Application -->
+  <!-- ================================================================ -->
+
+  <script type="module" src="js/app.js"></script>
+
+</body>
+</html>

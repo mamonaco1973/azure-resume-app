@@ -1,0 +1,422 @@
+/* ================================================================ */
+/* Base */
+/* ================================================================ */
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial,
+    sans-serif;
+  margin: 0;
+  background: #f6f8fa;
+  color: #222;
+}
+
+.hidden {
+  display: none;
+}
+
+/* ================================================================ */
+/* Header */
+/* ================================================================ */
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  background: white;
+  border-bottom: 1px solid #ddd;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.actions button {
+  margin-left: 10px;
+}
+
+/* ================================================================ */
+/* Buttons */
+/* ================================================================ */
+
+button {
+  background: #2d6cdf;
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+button:hover {
+  background: #1f4fb2;
+}
+
+button:disabled {
+  background: #bbb;
+  cursor: not-allowed;
+}
+
+/* ================================================================ */
+/* Layout */
+/* ================================================================ */
+
+main {
+  padding: 24px;
+}
+
+/* ================================================================ */
+/* Table */
+/* ================================================================ */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+}
+
+thead {
+  background: #f1f3f5;
+}
+
+th,
+td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid #e6e6e6;
+}
+
+th {
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+}
+
+tr:hover {
+  background: #f9fbfd;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.row-actions a {
+  text-decoration: none;
+  color: #2d6cdf;
+}
+
+.row-actions .open-job-btn {
+  background: #2d6cdf;
+  color: white;
+}
+
+.row-actions .open-job-btn:hover {
+  background: #1f4fb2;
+}
+
+.row-actions .delete-job-btn {
+  background: #d64545;
+  color: white;
+}
+
+.row-actions .delete-job-btn:hover {
+  background: #b33434;
+}
+
+/* ================================================================ */
+/* Status badges */
+/* ================================================================ */
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.status-submitted {
+  background: #e7f0ff;
+  color: #1f4fb2;
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+.status-Scoring {
+  background: #fff4d6;
+  color: #a66b00;
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+.status-processing {
+  background: #fff4d6;
+  color: #a66b00;
+}
+
+.status-scored {
+  background: #e6f6ec;
+  color: #1b7a3c;
+}
+
+.status-Scored {
+  background: #e6f6ec;
+  color: #1b7a3c;
+}
+
+.status-error,
+.status-Error {
+  background: #fdeaea;
+  color: #b33434;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.45; }
+}
+
+/* ================================================================ */
+/* Table loading state — dims rows while a fetch is in-flight      */
+/* ================================================================ */
+
+#jobs-table.loading tbody {
+  opacity: 0.35;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+/* ================================================================ */
+/* Auto-refresh indicator                                           */
+/* ================================================================ */
+
+/* display:inline-flex is only applied when .hidden is absent — avoids
+   the ID selector overriding .hidden { display:none } on this element */
+#auto-refresh-indicator:not(.hidden) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #555;
+}
+
+#auto-refresh-indicator .spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #ccc;
+  border-top-color: #1f4fb2;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ================================================================ */
+/* Empty state */
+/* ================================================================ */
+
+#empty-state {
+  text-align: center;
+  padding: 40px;
+  background: white;
+  border: 1px dashed #ccc;
+}
+
+/* ================================================================ */
+/* Modal */
+/* ================================================================ */
+
+.modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.modal.hidden {
+  display: none;
+}
+
+.modal-content {
+  background: white;
+  padding: 24px;
+  width: 500px;
+  max-width: 90%;
+  border-radius: 6px;
+}
+
+.modal-content h2 {
+  margin-top: 0;
+}
+
+.modal-content label {
+  display: block;
+  margin-top: 12px;
+  font-weight: 600;
+}
+
+.modal-content input,
+.modal-content textarea,
+.modal-content select {
+  width: 100%;
+  margin-top: 4px;
+  padding: 8px;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+
+.modal-content textarea {
+  height: 250px;
+  resize: vertical;
+}
+
+.modal-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* ================================================================ */
+/* Resume Manager */
+/* ================================================================ */
+
+.resume-modal-content {
+  width: 900px;
+  max-width: 95%;
+}
+
+.resume-manager {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 20px;
+  min-height: 420px;
+}
+
+.resume-sidebar {
+  border-right: 1px solid #e6e6e6;
+  padding-right: 16px;
+}
+
+.resume-sidebar-actions {
+  margin-bottom: 12px;
+}
+
+#resume-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.resume-list-item {
+  border: 1px solid #ddd;
+  background: #fff;
+  padding: 10px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.resume-list-item:hover {
+  background: #f7faff;
+}
+
+.resume-list-item.active {
+  border-color: #2d6cdf;
+  background: #eef4ff;
+}
+
+.resume-list-name {
+  font-weight: 600;
+}
+
+.resume-list-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #666;
+}
+
+.resume-editor h3 {
+  margin-top: 0;
+}
+
+.danger {
+  background: #d64545;
+}
+
+.danger:hover {
+  background: #b33434;
+}
+
+.job-detail-page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.button-link {
+  display: inline-block;
+  padding: 10px 14px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  text-decoration: none;
+  color: inherit;
+  background: #fff;
+}
+
+.accordion-section {
+  margin-bottom: 16px;
+  border: 1px solid #d9d9d9;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.accordion-section summary {
+  cursor: pointer;
+  padding: 14px 16px;
+  font-weight: 600;
+}
+
+.accordion-body {
+  padding: 0 16px 16px;
+  border-top: 1px solid #ececec;
+}
+
+.detail-grid {
+  display: grid;
+  gap: 12px;
+  padding-top: 16px;
+}
+
+.detail-row {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.detail-label {
+  font-weight: 600;
+}
+
+.detail-value {
+  word-break: break-word;
+}
+
+.form-control {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.detail-text-block {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
