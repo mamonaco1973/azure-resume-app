@@ -132,7 +132,6 @@ NOTE: Deploying web app...
 =================================================================================
   Resume Scorer — Deployment validated!
 =================================================================================
-  API : https://resume-func-<hex>.azurewebsites.net/api
   App : https://resumeweb<hex>.z9.web.core.windows.net/index.html
 =================================================================================
 ```
