@@ -1,18 +1,17 @@
 /* ========================================================================== */
 /* app.js                                                                      */
-/* Dashboard controller. Subscribes to Firebase auth state and drives the UI: */
-/* shows the auth modal when signed out, loads the job list when signed in.   */
+/* Dashboard controller. Subscribes to Entra auth state and drives the UI:   */
+/* redirects to sign-in when signed out, loads the job list when signed in.  */
 /* ========================================================================== */
 
 import { createJob, listResumes }                   from "./api.js";
 import { loadJobs, hasPendingJobs }                 from "./jobs.js";
 import { bindResumeHandlers, openResumeManager }    from "./resumes.js";
-import { onAuthChange, signIn, signUp, signOut }    from "./auth.js";
+import { onAuthChange, signIn, signOut }             from "./auth.js";
 
 let lastSelectedResumeId = "";
 let autoRefreshTimer     = null;
 let countdownInterval    = null;
-let authMode             = "signin";  // "signin" | "signup"
 
 const AUTO_REFRESH_SECONDS = 5;
 
@@ -20,11 +19,10 @@ document.addEventListener("DOMContentLoaded", () => {
   bindUiHandlers();
   bindResumeHandlers();
 
-  // Firebase auth state drives the entire UI — no manual token checks needed
+  // Entra auth state is read synchronously from sessionStorage on each load
   onAuthChange(async (user) => {
     updateAuthButtons(!!user);
     if (user) {
-      hideAuthModal();
       try {
         await refreshApp();
       } catch (error) {
@@ -32,7 +30,6 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     } else {
       showNotLoggedInMessage();
-      showAuthModal();
     }
   });
 });
@@ -40,38 +37,30 @@ document.addEventListener("DOMContentLoaded", () => {
 /* -------------------------------------------------------------------------- */
 /* Function: bindUiHandlers                                                    */
 /* Purpose: Attach all event listeners for the dashboard: modal open/close,  */
-/*          auth form, source type toggle, form submit, and auth buttons.     */
+/*          source type toggle, form submit, and auth buttons.                */
 /* -------------------------------------------------------------------------- */
 function bindUiHandlers() {
   const newJobModal    = document.getElementById("new-job-modal");
   const resumeModal    = document.getElementById("resume-modal");
 
-  const btnNewJob      = document.getElementById("btn-new-job");
+  const btnNewJob        = document.getElementById("btn-new-job");
   const btnManageResumes = document.getElementById("btn-manage-resumes");
-  const cancelNewJob   = document.getElementById("cancel-new-job");
-  const btnSignIn      = document.getElementById("btn-sign-in");
-  const btnSignOut     = document.getElementById("btn-sign-out");
-  const sourceType     = document.getElementById("source-type");
-  const resumeSelect   = document.getElementById("resume-select");
-  const newJobForm     = document.getElementById("new-job-form");
+  const cancelNewJob     = document.getElementById("cancel-new-job");
+  const btnSignIn        = document.getElementById("btn-sign-in");
+  const btnSignOut       = document.getElementById("btn-sign-out");
+  const sourceType       = document.getElementById("source-type");
+  const resumeSelect     = document.getElementById("resume-select");
+  const newJobForm       = document.getElementById("new-job-form");
 
   // ---------------------------------------------------------------------------
-  // Auth modal handlers
+  // Sign-in redirects to Entra hosted UI; sign-out clears token and redirects
   // ---------------------------------------------------------------------------
 
-  btnSignIn?.addEventListener("click", showAuthModal);
+  btnSignIn?.addEventListener("click", () => signIn());
 
   btnSignOut?.addEventListener("click", async () => {
     await signOut();
-    // onAuthChange fires automatically and shows the auth modal
   });
-
-  document.getElementById("auth-form")?.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    await handleAuthSubmit();
-  });
-
-  document.getElementById("btn-auth-toggle")?.addEventListener("click", toggleAuthMode);
 
   // ---------------------------------------------------------------------------
   // Track last selected resume across modal open/close cycles
@@ -144,79 +133,6 @@ function bindUiHandlers() {
   });
 
   document.getElementById("btn-refresh")?.addEventListener("click", refreshApp);
-}
-
-/* ================================================================================
-/* Auth Modal
-/* ================================================================================ */
-
-function showAuthModal() {
-  document.getElementById("auth-modal")?.classList.remove("hidden");
-}
-
-function hideAuthModal() {
-  const modal = document.getElementById("auth-modal");
-  modal?.classList.add("hidden");
-  document.getElementById("auth-error")?.classList.add("hidden");
-  document.getElementById("auth-form")?.reset();
-}
-
-/* -------------------------------------------------------------------------- */
-/* Function: toggleAuthMode                                                    */
-/* Purpose: Switch between Sign In and Create Account modes in the auth modal.*/
-/* -------------------------------------------------------------------------- */
-function toggleAuthMode() {
-  authMode = authMode === "signin" ? "signup" : "signin";
-  const isSignUp = authMode === "signup";
-  const title  = document.getElementById("auth-modal-title");
-  const submit = document.getElementById("btn-auth-submit");
-  const toggle = document.getElementById("btn-auth-toggle");
-  if (title)  title.textContent  = isSignUp ? "Create Account" : "Sign In";
-  if (submit) submit.textContent = isSignUp ? "Create Account" : "Sign In";
-  if (toggle) toggle.textContent = isSignUp ? "Sign In Instead" : "Create Account";
-  document.getElementById("auth-error")?.classList.add("hidden");
-}
-
-/* -------------------------------------------------------------------------- */
-/* Function: handleAuthSubmit                                                  */
-/* Purpose: Dispatch the Firebase sign-in or sign-up call and show any       */
-/*          error inline; on success Firebase triggers onAuthChange.          */
-/* -------------------------------------------------------------------------- */
-async function handleAuthSubmit() {
-  const email    = document.getElementById("auth-email")?.value.trim()  || "";
-  const password = document.getElementById("auth-password")?.value      || "";
-  const errorEl  = document.getElementById("auth-error");
-  const submitBtn = document.getElementById("btn-auth-submit");
-
-  if (errorEl) { errorEl.textContent = ""; errorEl.classList.add("hidden"); }
-  if (submitBtn) submitBtn.disabled = true;
-
-  try {
-    if (authMode === "signup") {
-      await signUp(email, password);
-    } else {
-      await signIn(email, password);
-    }
-    // onAuthChange fires automatically — no manual UI update needed here
-  } catch (error) {
-    if (errorEl) {
-      errorEl.textContent = formatFirebaseError(error);
-      errorEl.classList.remove("hidden");
-    }
-  } finally {
-    if (submitBtn) submitBtn.disabled = false;
-  }
-}
-
-function formatFirebaseError(error) {
-  const code = error.code || "";
-  if (code === "auth/invalid-credential" ||
-      code === "auth/user-not-found"     ||
-      code === "auth/wrong-password")        return "Invalid email or password.";
-  if (code === "auth/email-already-in-use")  return "Email is already in use.";
-  if (code === "auth/weak-password")         return "Password must be at least 6 characters.";
-  if (code === "auth/invalid-email")         return "Invalid email address.";
-  return error.message || "Authentication failed.";
 }
 
 /* ================================================================================
@@ -450,7 +366,7 @@ async function refreshApp() {
 /* -------------------------------------------------------------------------- */
 /* Function: updateAuthButtons                                                 */
 /* Purpose: Toggle sign-in/sign-out visibility and enable action buttons      */
-/*          based on the current Firebase auth state.                         */
+/*          based on the current auth state.                                  */
 /* -------------------------------------------------------------------------- */
 function updateAuthButtons(loggedIn) {
   document.getElementById("btn-sign-in")?.classList.toggle("hidden",  loggedIn);

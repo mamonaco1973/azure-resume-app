@@ -1,84 +1,138 @@
 #!/usr/bin/env bash
 # ================================================================================
 # check_env.sh
-# Validates local tooling, GCP credentials, and Vertex AI model access before
-# apply.sh or destroy.sh are allowed to proceed.
+# Validates local tooling, Azure credentials, and Entra External ID connectivity
+# before apply.sh or destroy.sh are allowed to proceed.
 # ================================================================================
-set -u
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CREDENTIALS="${SCRIPT_DIR}/credentials.json"
+set -euo pipefail
 
 # ================================================================================
 # Tool Validation
 # ================================================================================
 
-echo "NOTE: Validating required commands in PATH."
+echo "NOTE: Validating that required commands are found in your PATH."
 
-MISSING=0
-for CMD in gcloud terraform jq pip; do
-  if ! command -v "${CMD}" > /dev/null 2>&1; then
-    echo "ERROR: ${CMD} not found in PATH."
-    MISSING=1
+commands=("az" "terraform" "jq" "zip" "envsubst")
+
+all_found=true
+
+for cmd in "${commands[@]}"; do
+  if ! command -v "$cmd" &> /dev/null; then
+    echo "ERROR: $cmd is not found in the current PATH."
+    all_found=false
   else
-    echo "NOTE: ${CMD} found."
+    echo "NOTE: $cmd is found in the current PATH."
   fi
 done
 
-[ "${MISSING}" -ne 0 ] && { echo "ERROR: Missing required tools."; exit 1; }
-
-# ================================================================================
-# Credentials
-# ================================================================================
-
-if [ ! -f "${CREDENTIALS}" ]; then
-  echo "ERROR: credentials.json not found at ${CREDENTIALS}."
-  exit 1
-fi
-
-PROJECT_ID=$(jq -r '.project_id' "${CREDENTIALS}" 2>/dev/null || echo "")
-SA_EMAIL=$(jq  -r '.client_email' "${CREDENTIALS}" 2>/dev/null || echo "")
-
-if [ -z "${PROJECT_ID}" ] || [ -z "${SA_EMAIL}" ]; then
-  echo "ERROR: credentials.json missing project_id or client_email."
-  exit 1
-fi
-
-echo "NOTE: credentials.json found — project=${PROJECT_ID}, sa=${SA_EMAIL}"
-
-# ================================================================================
-# GCP Authentication
-# ================================================================================
-
-gcloud auth activate-service-account --key-file="${CREDENTIALS}" --quiet
-gcloud config set project "${PROJECT_ID}" --quiet
-echo "NOTE: Authenticated as ${SA_EMAIL}."
-
-# ================================================================================
-# API Setup
-# ================================================================================
-
-echo "NOTE: Running api_setup.sh (enables APIs, Firestore, Identity Platform)..."
-"${SCRIPT_DIR}/api_setup.sh"
-
-# ================================================================================
-# Vertex AI Model Check
-# ================================================================================
-
-GEMINI_MODEL_ID="${GEMINI_MODEL_ID:-gemini-2.5-flash}"
-echo "NOTE: Testing Vertex AI model ${GEMINI_MODEL_ID}..."
-
-ACCESS_TOKEN=$(gcloud auth print-access-token --quiet)
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/global/publishers/google/models/${GEMINI_MODEL_ID}:generateContent" \
-  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"contents":[{"role":"user","parts":[{"text":"Say OK"}]}]}')
-
-if [ "${HTTP_CODE}" = "200" ]; then
-  echo "NOTE: Vertex AI model ${GEMINI_MODEL_ID} accessible."
+if [ "$all_found" = true ]; then
+  echo "NOTE: All required commands are available."
 else
-  echo "ERROR: Vertex AI model ${GEMINI_MODEL_ID} not accessible (HTTP ${HTTP_CODE})."
-  echo "       Ensure the model is enabled in Model Garden and the SA has aiplatform.user."
+  echo "ERROR: One or more commands are missing."
   exit 1
 fi
+
+# ================================================================================
+# Environment Variables
+# ================================================================================
+
+echo "NOTE: Validating that required environment variables are set."
+
+required_vars=(
+  "ARM_CLIENT_ID"
+  "ARM_CLIENT_SECRET"
+  "ARM_SUBSCRIPTION_ID"
+  "ARM_TENANT_ID"
+  "ENTRA_TENANT_ID"
+  "ENTRA_TENANT_NAME"
+  "ENTRA_SP_CLIENT_ID"
+  "ENTRA_SP_CLIENT_SECRET"
+  "ENTRA_USER_FLOW_NAME"
+)
+
+all_set=true
+
+for var in "${required_vars[@]}"; do
+  if [ -z "${!var:-}" ]; then
+    echo "ERROR: $var is not set or is empty."
+    all_set=false
+  else
+    echo "NOTE: $var is set."
+  fi
+done
+
+if [ "$all_set" = true ]; then
+  echo "NOTE: All required environment variables are set."
+else
+  echo "ERROR: One or more required environment variables are missing or empty."
+  exit 1
+fi
+
+# ================================================================================
+# Azure Login
+# ================================================================================
+
+echo "NOTE: Logging in to Azure using Service Principal..."
+az login --service-principal \
+  --username "$ARM_CLIENT_ID" \
+  --password "$ARM_CLIENT_SECRET" \
+  --tenant   "$ARM_TENANT_ID" > /dev/null 2>&1
+
+if [ $? -ne 0 ]; then
+  echo "ERROR: Failed to log into Azure. Please check your credentials."
+  exit 1
+else
+  echo "NOTE: Successfully logged into Azure."
+fi
+
+# ================================================================================
+# Entra External ID Validation
+# Verifies the service principal can reach Graph API and the user flow exists.
+# ================================================================================
+
+echo "NOTE: Validating Entra External ID credentials and user flow..."
+
+_validate_entra() {
+  GRAPH_TOKEN=$(curl -s -X POST \
+    "https://login.microsoftonline.com/${ENTRA_TENANT_ID}/oauth2/v2.0/token" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "client_id=${ENTRA_SP_CLIENT_ID}" \
+    --data-urlencode "client_secret=${ENTRA_SP_CLIENT_SECRET}" \
+    --data-urlencode "scope=https://graph.microsoft.com/.default" \
+    | jq -r '.access_token')
+
+  if [[ -z "$GRAPH_TOKEN" || "$GRAPH_TOKEN" == "null" ]]; then
+    echo "WARNING: Failed to acquire Graph API token."
+    return 1
+  fi
+
+  FLOW_ID=$(curl -s -G \
+    --data-urlencode "\$filter=displayName eq '${ENTRA_USER_FLOW_NAME}'" \
+    "https://graph.microsoft.com/v1.0/identity/authenticationEventsFlows" \
+    -H "Authorization: Bearer ${GRAPH_TOKEN}" \
+    | jq -r '.value[0].id')
+
+  if [[ -z "$FLOW_ID" || "$FLOW_ID" == "null" ]]; then
+    echo "WARNING: User flow '${ENTRA_USER_FLOW_NAME}' not found in tenant '${ENTRA_TENANT_NAME}'."
+    return 1
+  fi
+
+  echo "NOTE: Entra service principal credentials are valid."
+  echo "NOTE: User flow '${ENTRA_USER_FLOW_NAME}' found (id: ${FLOW_ID})."
+}
+
+_GRAPH_MAX=10
+_GRAPH_DELAY=30
+for _attempt in $(seq 1 $_GRAPH_MAX); do
+  if _validate_entra; then
+    break
+  fi
+  if [[ $_attempt -lt $_GRAPH_MAX ]]; then
+    echo "NOTE: Retrying in ${_GRAPH_DELAY}s (attempt ${_attempt}/${_GRAPH_MAX})..."
+    sleep $_GRAPH_DELAY
+  else
+    echo "ERROR: Entra validation failed after ${_GRAPH_MAX} attempts."
+    echo "       Check ENTRA_SP_CLIENT_ID, ENTRA_SP_CLIENT_SECRET, and ENTRA_USER_FLOW_NAME."
+    exit 1
+  fi
+done

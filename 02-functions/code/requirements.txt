@@ -1,0 +1,9 @@
+azure-functions
+azure-cosmos
+azure-identity
+azure-servicebus
+azure-storage-blob
+openai
+beautifulsoup4
+PyJWT[crypto]
+requests

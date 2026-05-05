@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Signing in...</title>
+</head>
+<body>
+  <p>Completing sign-in...</p>
+  <script>
+  // Cannot use ES modules here — config.json loaded via fetch instead
+  (async function () {
+    const params = new URLSearchParams(window.location.search);
+    const code   = params.get("code");
+    const state  = params.get("state");
+    const error  = params.get("error");
+
+    if (error || !code) {
+      sessionStorage.removeItem("pkce_verifier");
+      sessionStorage.removeItem("pkce_state");
+      window.location.href = "index.html";
+      return;
+    }
+
+    // State check prevents CSRF on the redirect
+    const savedState = sessionStorage.getItem("pkce_state");
+    if (state !== savedState) {
+      window.location.href = "index.html";
+      return;
+    }
+
+    const verifier = sessionStorage.getItem("pkce_verifier");
+
+    let cfg;
+    try {
+      cfg = await fetch("config.json").then((r) => r.json());
+    } catch {
+      window.location.href = "index.html";
+      return;
+    }
+
+    const body = new URLSearchParams({
+      client_id:     cfg.clientId,
+      grant_type:    "authorization_code",
+      code,
+      redirect_uri:  cfg.redirectUri,
+      code_verifier: verifier,
+    });
+
+    let data;
+    try {
+      const resp = await fetch(
+        `${cfg.authority}/oauth2/v2.0/token`,
+        {
+          method:  "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
+        }
+      );
+      data = await resp.json();
+    } catch {
+      window.location.href = "index.html";
+      return;
+    }
+
+    if (data.id_token) {
+      sessionStorage.setItem("entra_id_token", data.id_token);
+    }
+
+    sessionStorage.removeItem("pkce_verifier");
+    sessionStorage.removeItem("pkce_state");
+    window.location.href = "index.html";
+  })();
+  </script>
+</body>
+</html>

@@ -5,113 +5,129 @@ with code in this repository.
 
 ## What This App Does
 
-GCP-based Resume Scoring Application. Users upload resumes and submit
-job postings (URL, raw text, or LinkedIn job IDs); the app uses Vertex
-AI Gemini to score resume-to-job compatibility (0--100) asynchronously.
+Azure-based Resume Scoring Application. Users upload resumes and submit
+job postings (URL or raw text); the app uses Azure OpenAI GPT-4o to score
+resume-to-job compatibility (0--100) asynchronously.
 
 ## Deployment Commands
 
 All deployment runs from the repo root:
 
 ``` bash
-./apply.sh      # Full deploy: pip deps, Terraform 3-phase, uploads SPA to GCS
-./destroy.sh    # Tear down entire stack (empties buckets, deletes Firestore docs)
-./check_env.sh  # Validate tools, credentials.json, Vertex AI connectivity
-./validate.sh   # Post-deploy: print gateway and webapp URLs
-```
-
-Python dependencies are installed into each Cloud Function source
-directory directly:
-
-``` bash
-pip install -r 02-functions/code/api/requirements.txt    -t 02-functions/code/api/
-pip install -r 02-functions/code/worker/requirements.txt -t 02-functions/code/worker/
+./apply.sh      # Full deploy: 3-stage Terraform + SPA upload
+./destroy.sh    # Tear down entire stack
+./check_env.sh  # Validate tools, credentials, Entra connectivity
+./validate.sh   # Post-deploy: print API and webapp URLs
 ```
 
 There are no test or lint commands configured.
 
+## Required Environment Variables
+
+`check_env.sh` validates all of these before any Terraform runs:
+
+```bash
+# Azure service principal — Terraform azurerm provider
+ARM_CLIENT_ID
+ARM_CLIENT_SECRET
+ARM_TENANT_ID
+ARM_SUBSCRIPTION_ID
+
+# Entra External ID tenant — azuread provider + Graph API user flow wiring
+ENTRA_TENANT_ID
+ENTRA_TENANT_NAME        # e.g. mytenant.onmicrosoft.com
+ENTRA_SP_CLIENT_ID
+ENTRA_SP_CLIENT_SECRET
+ENTRA_USER_FLOW_NAME     # display name of the self-service sign-up flow
+```
+
+`aoai-config.sh` sets `AOAI_MODEL_DEPLOYMENT` (default `gpt-4o`) and is
+sourced by `apply.sh` and `destroy.sh`.
+
 ## Architecture
 
-    01-backend/        # Terraform: SAs, IAM, GCS media bucket, Pub/Sub, Identity Platform key
-    02-functions/      # Terraform: Cloud Functions 2nd Gen, API Gateway; Python source
-      code/api/        # HTTP Cloud Function — resume + job CRUD
-      code/worker/     # Eventarc/Pub/Sub Cloud Function — Gemini scoring pipeline
-      openapi.yaml.tpl # API Gateway Swagger spec template
-    03-webapp/         # Terraform: public GCS website bucket
-      site/            # Vanilla JS SPA
-        js/config.js.tmpl  # Config template populated by apply.sh at deploy time
+    01-backend/        # Terraform: SB, Cosmos DB, Blob Storage, AOAI, Entra app
+    02-functions/      # Terraform: Function App (FC1 Flex); Python source
+      code/
+        function_app.py  # HTTP routes (resumes + jobs CRUD) + SB trigger worker
+        requirements.txt
+        host.json
+    03-webapp/         # Terraform: SPA asset upload to Blob Storage $web
+      site/            # Vanilla JS SPA (Entra PKCE auth)
+        js/config.js.tmpl  # Config template substituted by apply.sh
 
 ### Request Flow
 
-**Resume CRUD:** POST/GET/PUT/DELETE /resumes → API Gateway (JWT) →
-resume-api CF2 → Firestore (metadata) + GCS (text content)
+**Resume CRUD:** POST/GET/PUT/DELETE /api/resumes → Function App (JWT) →
+Cosmos DB (metadata) + Blob Storage (text content)
 
 **Job scoring:**
 
-1.  POST /jobs → API Gateway → resume-api CF2 → copies resume snapshot
-    to GCS, publishes to Pub/Sub → returns job with `submitted` status
-2.  resume-worker CF2 (Eventarc Pub/Sub trigger) → fetches URL if
-    needed + strips HTML → Gemini 2-phase (extract metadata → score) →
-    writes job_analysis.txt to GCS → updates Firestore with `Scored`
-    status, score, job_title, company
-3.  Frontend polls GET /jobs (5 s auto-refresh) to show updated scores
+1.  POST /api/jobs → Function App → saves resume snapshot to Blob Storage,
+    publishes to Service Bus → returns job with `submitted` status
+2.  resume_scoring_worker (Service Bus trigger) → fetches URL if needed
+    + strips HTML → AOAI 2-phase (extract metadata → score) →
+    writes job_analysis.txt to Blob Storage → updates Cosmos DB with
+    `Scored` status, score, job_title, company_name
+3.  Frontend polls GET /api/jobs (5 s auto-refresh) to show updated scores
 
-### Cloud Functions
+### Function App
 
--   **`code/api/main.py`** --- HTTP function; routes all CRUD by method
-    + path segments; extracts owner from `X-Apigateway-Api-Userinfo`
--   **`code/worker/main.py`** --- Eventarc function; decodes Pub/Sub
-    message; runs Gemini extraction + scoring pipeline
+-   **`code/function_app.py`** --- Single file with all HTTP routes and
+    the Service Bus queue trigger; JWT extracted from Bearer header;
+    `sub` claim becomes the Cosmos DB partition key
+-   Auth: JWT validated in code against Entra External ID JWKS (cached
+    per warm instance); no API Gateway needed
 
-### Data Model (Firestore)
+### Data Model (Cosmos DB)
 
-Collections: `resume_app_resumes`, `resume_app_jobs`
-Document ID: `{owner_uid}_{resource_id}`
+Database: `resume-app`
 
-### GCS Layout (media bucket)
+-   `resumes` container — partition key `/owner`; doc id `{owner}_{resume_id}`
+-   `jobs` container    — partition key `/owner`; doc id `{owner}_{job_id}`
 
-    users/{owner}/resumes/{resume_id}.txt
-    users/{owner}/jobs/{job_id}/job_description.txt
-    users/{owner}/jobs/{job_id}/resume_snapshot.txt
-    users/{owner}/jobs/{job_id}/job_analysis.txt
-    users/{owner}/jobs/{job_id}/notes.txt
+### Blob Storage Layout (media account)
 
-### Key Terraform Variables (`02-functions/main.tf`)
+    resumes/{owner}/{resume_id}.txt
+    jobs/{owner}/{job_id}/
+      resume_snapshot.txt
+      job_description.txt    (URL-fetched or raw text, then cleaned by AOAI)
+      job_analysis.txt       (AOAI scoring result)
+      notes.txt              (user annotations)
 
--   `media_bucket_name` --- passed from 01-backend output
--   `gemini_model_id` --- passed from `gemini-config.sh` (default
-    `gemini-2.0-flash-001`)
+### Key Terraform Variables
+
+-   `aoai_endpoint`         — from 01-backend output
+-   `aoai_model_deployment` — from `aoai-config.sh` (default `gpt-4o`)
 
 ### Authentication
 
-GCP Identity Platform (Firebase Auth) with email/password. In-page
-sign-in modal — no redirect flow. Firebase JS SDK v11.1.0 loaded via
-importmap. API Gateway validates Firebase JWTs via Swagger
-`securityDefinitions` (`x-google-issuer`, `x-google-jwks_uri`).
+Microsoft Entra External ID (PKCE). Login button redirects to Entra hosted
+UI — no inline email/password form. Token stored in sessionStorage after
+code exchange in `callback.html`. API validates JWT against JWKS.
 
 ### Frontend Config
 
-`03-webapp/site/js/config.js.tmpl` is a template --- `apply.sh`
-substitutes `FIREBASE_API_KEY`, `PROJECT_ID`, and `API_BASE_URL` at
-deploy time to produce `config.js`. Never edit `config.js` directly.
+`03-webapp/site/js/config.js.tmpl` is a template — `apply.sh` substitutes
+`ENTRA_AUTHORITY`, `ENTRA_CLIENT_ID`, `REDIRECT_URI`, and `API_BASE_URL`
+at deploy time to produce `config.js`. Never edit `config.js` directly.
+`callback.html` reads `config.json` (also generated by `apply.sh`).
 
-## Changing the Gemini Model
+## Changing the Azure OpenAI Model
 
-Edit the single `export` line in `gemini-config.sh`:
+Edit the single `export` line in `aoai-config.sh`:
 
 ```bash
-export GEMINI_MODEL_ID="gemini-2.0-flash-001"
+export AOAI_MODEL_DEPLOYMENT="gpt-4o"
 ```
 
-This flows to `check_env.sh` (pre-flight probe), the worker CF2
-`GEMINI_MODEL_ID` env var via Terraform, and `code/worker/main.py` at
-runtime. If the new model has a different response schema, also update
-the prompt strings in `02-functions/code/worker/main.py`.
+This flows to the worker's `AOAI_MODEL_DEPLOYMENT` env var via Terraform.
+If the new model has a different response schema, also update the prompt
+strings in `02-functions/code/function_app.py`.
 
 ## Code Commenting Standards
 
-Claude should apply consistent, professional commenting when modifying
-code.
+Claude should apply consistent, professional commenting when modifying code.
 
 ### General Rules
 
@@ -138,22 +154,7 @@ Modules should begin with a structured header:
 # ================================================================================
 ```
 
-Functions should include a short structured description:
-
-```python
-# --------------------------------------------------------------------------------
-# Function: function_name
-#
-# Purpose
-# Explain what the function does.
-#
-# Arguments
-# - arg_name : description
-#
-# Returns
-# - description
-# --------------------------------------------------------------------------------
-```
+Functions should use Google-style docstrings.
 
 ### Terraform Files
 
@@ -175,56 +176,19 @@ resource definition.
 - Do not change UI behavior unless explicitly asked
 - Preserve existing function names, IDs, and DOM structure
 - Prefer concise section banners for major areas
-- Use comments to explain intent, data flow, and UI behavior
-- Do not add noisy comments for obvious one-line DOM operations
-- Keep comments professional and compact
-- Prefer small, reviewable diffs
 
 Use section banners like:
 
 ```javascript
 /* ================================================================================ */
-/* Section Name */
-/* Purpose of this section */
+/* Section Name                                                                      */
+/* Purpose of this section                                                           */
 /* ================================================================================ */
-```
-
-For functions, use short block comments when helpful:
-
-```javascript
-/* -------------------------------------------------------------------------------- */
-/* Function: functionName                                                            */
-/* Purpose: Explain what this function does                                         */
-/* -------------------------------------------------------------------------------- */
 ```
 
 ### Shell Scripts
 
 - Keep comment lines <= 80 characters
 - Preserve strict bash style: set -euo pipefail
-- Use your quick start comment style
 - Prefer bannered sections for each major operation
 - Explain why a command block exists, not what obvious flags do
-- Keep comments concise and operational
-- Do not rewrite working command structure unless explicitly asked
-- Preserve variable names unless a rename is necessary
-- Prefer readable step-by-step execution flow
-- Keep scripts idempotent where possible
-
-Scripts should use section banners like:
-
-```bash
-# ================================================================================
-# Section Name
-# Purpose of this block
-# ================================================================================
-```
-
-For smaller subsections:
-
-```bash
-# --------------------------------------------------------------------------------
-# Subsection Name
-# Brief operational note
-# --------------------------------------------------------------------------------
-```

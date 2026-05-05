@@ -1,60 +1,69 @@
 /* ========================================================================== */
 /* auth.js                                                                     */
-/* Firebase Auth helpers: initialise the Firebase app, manage sign-in/out,   */
-/* and vend fresh ID tokens for API requests.                                 */
+/* Entra External ID PKCE auth helpers. Token is stored in sessionStorage     */
+/* after the code exchange in callback.html; cleared on sign-out.             */
 /* ========================================================================== */
-
-import { initializeApp }                        from "firebase/app";
-import {
-  getAuth,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signOut as fbSignOut
-} from "firebase/auth";
 
 import { CONFIG } from "./config.js";
 
-// -----------------------------------------------------------------------------
-// Firebase Initialisation
-// -----------------------------------------------------------------------------
-
-const app  = initializeApp({
-  apiKey:    CONFIG.apiKey,
-  authDomain: CONFIG.authDomain,
-  projectId: CONFIG.projectId,
-});
-
-export const auth = getAuth(app);
+const TOKEN_KEY    = "entra_id_token";
+const VERIFIER_KEY = "pkce_verifier";
+const STATE_KEY    = "pkce_state";
 
 // -----------------------------------------------------------------------------
-// Token access — Firebase auto-refreshes tokens before they expire
+// Token access
 // -----------------------------------------------------------------------------
 
 export async function getIdToken() {
-  const user = auth.currentUser;
-  if (!user) return "";
-  return user.getIdToken();
+  return sessionStorage.getItem(TOKEN_KEY) || "";
 }
 
 export function isLoggedIn() {
-  return !!auth.currentUser;
+  const token = sessionStorage.getItem(TOKEN_KEY);
+  if (!token) return false;
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    return payload.exp > Date.now() / 1000;
+  } catch {
+    return false;
+  }
 }
 
 // -----------------------------------------------------------------------------
 // Auth operations
 // -----------------------------------------------------------------------------
 
-export async function signIn(email, password) {
-  return signInWithEmailAndPassword(auth, email, password);
+export function signIn() {
+  const verifier = _generateVerifier();
+  const state    = _generateState();
+  sessionStorage.setItem(VERIFIER_KEY, verifier);
+  sessionStorage.setItem(STATE_KEY,    state);
+
+  _codeChallenge(verifier).then((challenge) => {
+    const params = new URLSearchParams({
+      client_id:             CONFIG.ENTRA_CLIENT_ID,
+      response_type:         "code",
+      redirect_uri:          CONFIG.REDIRECT_URI,
+      // openid + client_id scope returns an id_token in the token response
+      scope:                 `openid profile ${CONFIG.ENTRA_CLIENT_ID}`,
+      code_challenge:        challenge,
+      code_challenge_method: "S256",
+      state,
+    });
+    window.location.href =
+      `${CONFIG.ENTRA_AUTHORITY}/oauth2/v2.0/authorize?${params}`;
+  });
 }
 
-export async function signUp(email, password) {
-  return createUserWithEmailAndPassword(auth, email, password);
-}
-
-export async function signOut() {
-  return fbSignOut(auth);
+export function signOut() {
+  sessionStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(VERIFIER_KEY);
+  sessionStorage.removeItem(STATE_KEY);
+  const post = encodeURIComponent(
+    `${window.location.origin}/index.html`
+  );
+  window.location.href =
+    `${CONFIG.ENTRA_AUTHORITY}/oauth2/v2.0/logout?post_logout_redirect_uri=${post}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -62,20 +71,38 @@ export async function signOut() {
 // -----------------------------------------------------------------------------
 
 export function onAuthChange(callback) {
-  return onAuthStateChanged(auth, callback);
+  // Fires once synchronously — sessionStorage is available immediately,
+  // no async restoration needed (unlike Firebase)
+  callback(isLoggedIn() ? { token: sessionStorage.getItem(TOKEN_KEY) } : null);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Function: waitForUser                                                        */
-/* Purpose: Resolve with the current user once Firebase has restored the      */
-/*          session from storage. Avoids acting on a null currentUser that    */
-/*          exists only because initialisation hasn't completed yet.          */
-/* -------------------------------------------------------------------------- */
 export function waitForUser() {
-  return new Promise((resolve) => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      unsubscribe();
-      resolve(user);
-    });
-  });
+  return Promise.resolve(
+    isLoggedIn() ? { token: sessionStorage.getItem(TOKEN_KEY) } : null
+  );
+}
+
+// -----------------------------------------------------------------------------
+// PKCE helpers
+// -----------------------------------------------------------------------------
+
+function _generateVerifier() {
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  return btoa(String.fromCharCode(...buf))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function _generateState() {
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  return btoa(String.fromCharCode(...buf))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+async function _codeChallenge(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 }
