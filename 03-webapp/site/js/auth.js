@@ -44,8 +44,8 @@ export function signIn() {
       client_id:             CONFIG.ENTRA_CLIENT_ID,
       response_type:         "code",
       redirect_uri:          CONFIG.REDIRECT_URI,
-      // openid + client_id scope returns an id_token in the token response
-      scope:                 `openid profile ${CONFIG.ENTRA_CLIENT_ID}`,
+      // openid profile is sufficient for id_token in Entra External ID
+      scope:                 "openid profile",
       code_challenge:        challenge,
       code_challenge_method: "S256",
       state,
