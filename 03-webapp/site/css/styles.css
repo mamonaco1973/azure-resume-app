@@ -396,6 +396,14 @@ tr:hover {
   pointer-events: none;
 }
 
+/* Applied during bulk delete/move to block interaction and signal activity */
+main.table-busy,
+.filter-bar.table-busy {
+  opacity: 0.5;
+  pointer-events: none;
+  user-select: none;
+}
+
 .modal-content {
   background: white;
   padding: 24px;

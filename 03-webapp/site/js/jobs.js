@@ -305,6 +305,16 @@ function populateBulkFolderSelect() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Function: setTableBusy                                                      */
+/* Purpose: Grey out the table and filter bar during bulk operations so the   */
+/*          user sees the UI is working rather than an unresponsive screen.   */
+/* -------------------------------------------------------------------------- */
+function setTableBusy(busy) {
+  document.querySelector("main")?.classList.toggle("table-busy", busy);
+  document.getElementById("filter-bar")?.classList.toggle("table-busy", busy);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Function: bindBulkHandlers                                                  */
 /* Purpose: Wire the Delete Selected and Move buttons once on first load.     */
 /* -------------------------------------------------------------------------- */
@@ -320,19 +330,23 @@ function bindBulkHandlers() {
       { title: "Delete Jobs", confirmText: "Delete", danger: true }
     );
     if (!confirmed) return;
-    const btn = document.getElementById("btn-bulk-delete");
+    const btn   = document.getElementById("btn-bulk-delete");
+    const label = document.getElementById("bulk-count");
     try {
       if (btn) { btn.disabled = true; btn.innerHTML = "…"; }
-      for (const jobId of ids) {
-        await deleteJob(jobId);
-        jobs = jobs.filter((j) => j.job_id !== jobId);
-        selectedJobIds.delete(jobId);
+      setTableBusy(true);
+      for (let i = 0; i < ids.length; i++) {
+        if (label) label.textContent = `Deleting ${i + 1} of ${n}…`;
+        await deleteJob(ids[i]);
+        jobs = jobs.filter((j) => j.job_id !== ids[i]);
+        selectedJobIds.delete(ids[i]);
       }
       renderJobsTable();
     } catch (error) {
       await showAlert(`Delete failed: ${error.message}`, { title: "Error" });
       renderJobsTable();
     } finally {
+      setTableBusy(false);
       if (btn) { btn.disabled = false; btn.innerHTML = ICON_TRASH; }
     }
   });
@@ -341,12 +355,16 @@ function bindBulkHandlers() {
     const ids      = [...selectedJobIds];
     const folderId = document.getElementById("bulk-folder-select")?.value || null;
     if (!ids.length) return;
-    const btn = document.getElementById("btn-bulk-move");
+    const n     = ids.length;
+    const btn   = document.getElementById("btn-bulk-move");
+    const label = document.getElementById("bulk-count");
     try {
       if (btn) { btn.disabled = true; btn.innerHTML = "…"; }
-      for (const jobId of ids) {
-        await moveJobToFolder(jobId, folderId);
-        const job = jobs.find((j) => j.job_id === jobId);
+      setTableBusy(true);
+      for (let i = 0; i < ids.length; i++) {
+        if (label) label.textContent = `Moving ${i + 1} of ${n}…`;
+        await moveJobToFolder(ids[i], folderId);
+        const job = jobs.find((j) => j.job_id === ids[i]);
         if (job) job.folder_id = folderId || "";
       }
       selectedJobIds.clear();
@@ -354,6 +372,7 @@ function bindBulkHandlers() {
     } catch (error) {
       await showAlert(`Move failed: ${error.message}`, { title: "Error" });
     } finally {
+      setTableBusy(false);
       if (btn) { btn.disabled = false; btn.innerHTML = ICON_ARROW; }
     }
   });

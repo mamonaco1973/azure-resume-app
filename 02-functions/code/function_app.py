@@ -1321,6 +1321,25 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
             ],
         )
 
+    # Guard against batch over-runs — multiple jobs may have been queued
+    # before the API submission check saw the limit was approaching.
+    usage = _get_usage_doc(owner)
+    if usage.get("tokens_used", 0) >= usage.get("token_limit", TOKEN_LIMIT_DEFAULT):
+        logging.warning(
+            "Worker: token limit exceeded, skipping. job=%s owner=%s",
+            job_id, owner,
+        )
+        try:
+            _update_job(
+                status="Failed",
+                error_message="Token limit reached. This job was not scored.",
+            )
+        except Exception:
+            pass
+        # Return without re-raising — this is a definitive failure, not
+        # a transient error, so Service Bus must not retry this message.
+        return
+
     try:
         _update_job(status="Scoring")
 
