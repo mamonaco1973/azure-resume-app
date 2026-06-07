@@ -78,6 +78,56 @@ resource "azurerm_cosmosdb_sql_container" "jobs" {
   }
 }
 
+# ------------------------------------------------------------------------------
+# Folders container — no TTL; user-defined job folders
+# ------------------------------------------------------------------------------
+resource "azurerm_cosmosdb_sql_container" "folders" {
+  name                = "folders"
+  resource_group_name = azurerm_resource_group.resume.name
+  account_name        = azurerm_cosmosdb_account.resume.name
+  database_name       = azurerm_cosmosdb_sql_database.resume.name
+  partition_key_paths = ["/owner"]
+
+  default_ttl = -1
+
+  throughput = 400
+
+  indexing_policy {
+    indexing_mode = "consistent"
+    included_path { path = "/*" }
+    excluded_path { path = "/\"_etag\"/?" }
+  }
+
+  lifecycle {
+    ignore_changes = [indexing_policy]
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Users container — token usage per user; no TTL
+# ------------------------------------------------------------------------------
+resource "azurerm_cosmosdb_sql_container" "users" {
+  name                = "users"
+  resource_group_name = azurerm_resource_group.resume.name
+  account_name        = azurerm_cosmosdb_account.resume.name
+  database_name       = azurerm_cosmosdb_sql_database.resume.name
+  partition_key_paths = ["/owner"]
+
+  default_ttl = -1
+
+  throughput = 400
+
+  indexing_policy {
+    indexing_mode = "consistent"
+    included_path { path = "/*" }
+    excluded_path { path = "/\"_etag\"/?" }
+  }
+
+  lifecycle {
+    ignore_changes = [indexing_policy]
+  }
+}
+
 # ================================================================================
 # Cosmos DB RBAC — custom role for the Function App managed identity
 # Scoped to the account so both containers are accessible.

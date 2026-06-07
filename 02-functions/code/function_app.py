@@ -6,14 +6,17 @@
 # queue trigger worker. Replaces the separate GCP Cloud Functions (api + worker).
 #
 # Key Responsibilities
-# - HTTP routes: resume CRUD + job CRUD (JWT-authenticated via Entra External ID)
+# - HTTP routes: resume CRUD + job CRUD + folder CRUD + attachment CRUD
+# - GET /usage — per-user AOAI token consumption tracking
 # - JWT validation against Entra External ID JWKS (cached per warm instance)
-# - Cosmos DB operations for resume and job metadata
-# - Blob Storage operations for resume text and job artifacts
+# - Cosmos DB operations for resume, job, folder, and user metadata
+# - Blob Storage operations for resume text, job artifacts, and attachments
 # - Service Bus message publishing (job submission)
 # - Service Bus queue trigger: 2-phase Azure OpenAI scoring pipeline
+#   with atomic token usage accumulation
 # ================================================================================
 
+import base64
 import json
 import logging
 import os
@@ -38,10 +41,12 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 # Configuration (injected by Terraform via Function App settings)
 # ================================================================================
 
-COSMOS_ENDPOINT          = os.environ["COSMOS_ENDPOINT"]
-COSMOS_DATABASE          = os.environ["COSMOS_DATABASE_NAME"]
-COSMOS_RESUMES_CONTAINER = os.environ["COSMOS_RESUMES_CONTAINER"]
-COSMOS_JOBS_CONTAINER    = os.environ["COSMOS_JOBS_CONTAINER"]
+COSMOS_ENDPOINT            = os.environ["COSMOS_ENDPOINT"]
+COSMOS_DATABASE            = os.environ["COSMOS_DATABASE_NAME"]
+COSMOS_RESUMES_CONTAINER   = os.environ["COSMOS_RESUMES_CONTAINER"]
+COSMOS_JOBS_CONTAINER      = os.environ["COSMOS_JOBS_CONTAINER"]
+COSMOS_FOLDERS_CONTAINER   = os.environ["COSMOS_FOLDERS_CONTAINER"]
+COSMOS_USERS_CONTAINER     = os.environ["COSMOS_USERS_CONTAINER"]
 
 MEDIA_BLOB_ENDPOINT = os.environ["MEDIA_BLOB_ENDPOINT"]
 
@@ -59,7 +64,10 @@ SB_QUEUE_NAME     = os.environ["SERVICEBUS_QUEUE_NAME"]
 # Constants
 # ================================================================================
 
-JOB_RETENTION_DAYS = 90
+JOB_RETENTION_DAYS   = 90
+TOKEN_LIMIT_DEFAULT  = 100_000
+ATTACHMENT_MAX_FILES = 5
+ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # ================================================================================
 # Auth — Entra External ID JWT validation
@@ -136,7 +144,7 @@ def _get_cosmos_container(container_name: str):
     """Return a Cosmos DB container client authenticated via managed identity.
 
     Args:
-        container_name: Either COSMOS_RESUMES_CONTAINER or COSMOS_JOBS_CONTAINER.
+        container_name: The container name (resumes, jobs, folders, or users).
 
     Returns:
         A ContainerProxy for the specified container.
@@ -248,6 +256,54 @@ def _upload_blob(
     )
 
 
+def _upload_blob_bytes(
+    blob_service: BlobServiceClient,
+    container: str,
+    path: str,
+    data: bytes,
+    content_type: str = "application/octet-stream",
+) -> None:
+    """Upload raw bytes to blob storage, overwriting if present.
+
+    Args:
+        blob_service: An authenticated BlobServiceClient.
+        container: Container name.
+        path: Blob path within the container.
+        data: Raw bytes to upload.
+        content_type: MIME type for the blob.
+    """
+    from azure.storage.blob import ContentSettings
+    blob_service.get_blob_client(container, path).upload_blob(
+        data,
+        overwrite=True,
+        content_settings=ContentSettings(content_type=content_type),
+    )
+
+
+def _download_blob_bytes(
+    blob_service: BlobServiceClient, container: str, path: str
+) -> bytes:
+    """Download a blob as raw bytes.
+
+    Args:
+        blob_service: An authenticated BlobServiceClient.
+        container: Container name.
+        path: Blob path within the container.
+
+    Returns:
+        Raw bytes, or empty bytes if not found.
+    """
+    try:
+        return (
+            blob_service
+            .get_blob_client(container, path)
+            .download_blob()
+            .readall()
+        )
+    except Exception:
+        return b""
+
+
 def _delete_blob(
     blob_service: BlobServiceClient, container: str, path: str
 ) -> None:
@@ -260,6 +316,29 @@ def _delete_blob(
     """
     try:
         blob_service.get_blob_client(container, path).delete_blob()
+    except Exception:
+        pass
+
+
+def _delete_blob_prefix(
+    blob_service: BlobServiceClient, container: str, prefix: str
+) -> None:
+    """Delete all blobs whose path starts with prefix.
+
+    Used to clean up all attachments for a job on delete.
+
+    Args:
+        blob_service: An authenticated BlobServiceClient.
+        container: Container name.
+        prefix: Path prefix to match.
+    """
+    try:
+        container_client = blob_service.get_container_client(container)
+        for blob in container_client.list_blobs(name_starts_with=prefix):
+            try:
+                container_client.delete_blob(blob.name)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -444,6 +523,115 @@ def delete_resume(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ================================================================================
+# Folder Routes
+# ================================================================================
+
+@app.route(route="folders", methods=["GET"])
+def list_folders(req: func.HttpRequest) -> func.HttpResponse:
+    """List all folders for the authenticated user."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    container = _get_cosmos_container(COSMOS_FOLDERS_CONTAINER)
+    items = list(container.query_items(
+        query=(
+            "SELECT * FROM c WHERE c.owner = @owner "
+            "ORDER BY c.created_at ASC"
+        ),
+        parameters=[{"name": "@owner", "value": owner}],
+        enable_cross_partition_query=False,
+    ))
+
+    return _resp(200, [
+        {
+            "folder_id":  item["folder_id"],
+            "name":       item.get("name", ""),
+            "created_at": item.get("created_at"),
+        }
+        for item in items
+    ])
+
+
+@app.route(route="folders", methods=["POST"])
+def create_folder(req: func.HttpRequest) -> func.HttpResponse:
+    """Create a new folder."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _resp(400, {"error": "Invalid JSON"})
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return _resp(400, {"error": "name is required"})
+
+    folder_id = _make_id()
+    now       = _now_iso()
+
+    doc = {
+        "id":         f"{owner}_{folder_id}",
+        "owner":      owner,
+        "folder_id":  folder_id,
+        "name":       name,
+        "created_at": now,
+    }
+    _get_cosmos_container(COSMOS_FOLDERS_CONTAINER).create_item(body=doc)
+
+    logging.info("Created folder owner=%s folder_id=%s", owner, folder_id)
+    return _resp(201, {"folder_id": folder_id, "name": name})
+
+
+@app.route(route="folders/{folder_id}", methods=["DELETE"])
+def delete_folder(req: func.HttpRequest) -> func.HttpResponse:
+    """Delete a folder. Jobs inside are unassigned (folder_id cleared)."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    folder_id = req.route_params.get("folder_id", "")
+    if not folder_id:
+        return _resp(400, {"error": "Missing folder_id"})
+
+    container = _get_cosmos_container(COSMOS_FOLDERS_CONTAINER)
+    try:
+        container.read_item(item=f"{owner}_{folder_id}", partition_key=owner)
+    except cosmos_exc.CosmosResourceNotFoundError:
+        return _resp(404, {"error": "Not found"})
+
+    container.delete_item(item=f"{owner}_{folder_id}", partition_key=owner)
+
+    # Unassign all jobs in this folder
+    jobs_container = _get_cosmos_container(COSMOS_JOBS_CONTAINER)
+    affected = list(jobs_container.query_items(
+        query=(
+            "SELECT c.id, c.job_id FROM c "
+            "WHERE c.owner = @owner AND c.folder_id = @folder_id"
+        ),
+        parameters=[
+            {"name": "@owner",     "value": owner},
+            {"name": "@folder_id", "value": folder_id},
+        ],
+        enable_cross_partition_query=False,
+    ))
+    for job in affected:
+        try:
+            jobs_container.patch_item(
+                item=job["id"],
+                partition_key=owner,
+                patch_operations=[{"op": "set", "path": "/folder_id", "value": None}],
+            )
+        except Exception:
+            pass
+
+    logging.info("Deleted folder owner=%s folder_id=%s", owner, folder_id)
+    return _resp(200, {"folder_id": folder_id, "deleted": True})
+
+
+# ================================================================================
 # Job Routes
 # ================================================================================
 
@@ -466,16 +654,18 @@ def list_jobs(req: func.HttpRequest) -> func.HttpResponse:
 
     return _resp(200, [
         {
-            "job_id":      item["job_id"],
-            "resume_id":   item.get("resume_id"),
-            "resume_name": item.get("resume_name"),
-            "status":      item.get("status"),
-            "score":       item.get("score"),
-            "job_title":   item.get("job_title"),
-            "company":     item.get("company_name"),  # mapped for frontend
-            "source_type": item.get("source_type"),
-            "source_url":  item.get("source_url"),
-            "created_at":  item.get("created_at"),
+            "job_id":           item["job_id"],
+            "resume_id":        item.get("resume_id"),
+            "resume_name":      item.get("resume_name"),
+            "folder_id":        item.get("folder_id"),
+            "status":           item.get("status"),
+            "score":            item.get("score"),
+            "job_title":        item.get("job_title"),
+            "company":          item.get("company_name"),
+            "source_type":      item.get("source_type"),
+            "job_url":          item.get("source_url"),
+            "created_at":       item.get("created_at"),
+            "attachment_count": len(item.get("attachments") or []),
         }
         for item in items
     ])
@@ -501,6 +691,7 @@ def create_job(req: func.HttpRequest) -> func.HttpResponse:
     source_type     = (body.get("source_type") or "url").strip()
     source_url      = (body.get("job_url") or "").strip()
     job_description = (body.get("job_description") or "").strip()
+    folder_id       = (body.get("folder_id") or "").strip() or None
 
     if not resume_id:
         return _resp(400, {"error": "resume_id is required"})
@@ -512,6 +703,11 @@ def create_job(req: func.HttpRequest) -> func.HttpResponse:
         return _resp(
             400, {"error": "job_description is required for source_type=raw_text"}
         )
+
+    # Enforce token cap before queuing the job
+    usage = _get_usage_doc(owner)
+    if usage.get("tokens_used", 0) >= usage.get("token_limit", TOKEN_LIMIT_DEFAULT):
+        return _resp(429, {"error": "token_limit_exceeded"})
 
     # Load resume metadata and text
     try:
@@ -559,12 +755,14 @@ def create_job(req: func.HttpRequest) -> func.HttpResponse:
         "job_id":       job_id,
         "resume_id":    resume_id,
         "resume_name":  resume_name,
+        "folder_id":    folder_id,
         "source_type":  source_type,
         "source_url":   source_url,
         "status":       "submitted",
         "score":        None,
         "job_title":    None,
         "company_name": None,
+        "attachments":  [],
         "created_at":   now,
     }
     _get_cosmos_container(COSMOS_JOBS_CONTAINER).create_item(body=doc)
@@ -575,8 +773,8 @@ def create_job(req: func.HttpRequest) -> func.HttpResponse:
     return _resp(202, {"job_id": job_id, "status": "submitted"})
 
 
-# Route ordering matters: the notes sub-route must be registered before
-# the generic {job_id} route so Azure Functions matches it correctly.
+# Route ordering matters: sub-routes must be registered before the generic
+# {job_id} route so Azure Functions matches them correctly.
 
 @app.route(route="jobs/{job_id}/notes", methods=["PATCH"])
 def update_job_notes(req: func.HttpRequest) -> func.HttpResponse:
@@ -610,6 +808,214 @@ def update_job_notes(req: func.HttpRequest) -> func.HttpResponse:
     return _resp(200, {"job_id": job_id, "updated": True})
 
 
+@app.route(route="jobs/{job_id}/folder", methods=["PATCH"])
+def move_job_to_folder(req: func.HttpRequest) -> func.HttpResponse:
+    """Assign or unassign a job to a folder."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    job_id = req.route_params.get("job_id", "")
+    if not job_id:
+        return _resp(400, {"error": "Missing job_id"})
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _resp(400, {"error": "Invalid JSON"})
+
+    folder_id = body.get("folder_id") or None
+
+    container = _get_cosmos_container(COSMOS_JOBS_CONTAINER)
+    try:
+        container.read_item(item=f"{owner}_{job_id}", partition_key=owner)
+    except cosmos_exc.CosmosResourceNotFoundError:
+        return _resp(404, {"error": "Not found"})
+
+    container.patch_item(
+        item=f"{owner}_{job_id}",
+        partition_key=owner,
+        patch_operations=[{"op": "set", "path": "/folder_id", "value": folder_id}],
+    )
+    return _resp(200, {"job_id": job_id, "folder_id": folder_id})
+
+
+# ================================================================================
+# Attachment Routes
+# Attachments are stored as blobs at jobs/{owner}/{job_id}/attachments/{att_id}/
+# and the metadata list is maintained on the job Cosmos document.
+# Base64 JSON transfer avoids signed-URL and content-type complications.
+# ================================================================================
+
+@app.route(route="jobs/{job_id}/attachments", methods=["GET"])
+def list_attachments(req: func.HttpRequest) -> func.HttpResponse:
+    """List attachment metadata for a job."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    job_id = req.route_params.get("job_id", "")
+    if not job_id:
+        return _resp(400, {"error": "Missing job_id"})
+
+    try:
+        item = _get_cosmos_container(COSMOS_JOBS_CONTAINER).read_item(
+            item=f"{owner}_{job_id}", partition_key=owner
+        )
+    except cosmos_exc.CosmosResourceNotFoundError:
+        return _resp(404, {"error": "Not found"})
+
+    return _resp(200, item.get("attachments") or [])
+
+
+@app.route(route="jobs/{job_id}/attachments", methods=["POST"])
+def upload_attachment(req: func.HttpRequest) -> func.HttpResponse:
+    """Upload a file attachment to a job (base64-encoded JSON body).
+
+    Enforces a 5-file cap and 10 MB per-file limit.
+    """
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    job_id = req.route_params.get("job_id", "")
+    if not job_id:
+        return _resp(400, {"error": "Missing job_id"})
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _resp(400, {"error": "Invalid JSON"})
+
+    filename     = (body.get("filename") or "").strip()
+    content_type = (body.get("content_type") or "application/octet-stream").strip()
+    data_b64     = (body.get("data") or "").strip()
+
+    if not filename:
+        return _resp(400, {"error": "filename is required"})
+    if not data_b64:
+        return _resp(400, {"error": "data is required"})
+
+    try:
+        raw_bytes = base64.b64decode(data_b64)
+    except Exception:
+        return _resp(400, {"error": "data must be valid base64"})
+
+    if len(raw_bytes) > ATTACHMENT_MAX_BYTES:
+        return _resp(413, {"error": "File exceeds 10 MB limit"})
+
+    jobs_container = _get_cosmos_container(COSMOS_JOBS_CONTAINER)
+    try:
+        job_doc = jobs_container.read_item(
+            item=f"{owner}_{job_id}", partition_key=owner
+        )
+    except cosmos_exc.CosmosResourceNotFoundError:
+        return _resp(404, {"error": "Not found"})
+
+    attachments = list(job_doc.get("attachments") or [])
+    if len(attachments) >= ATTACHMENT_MAX_FILES:
+        return _resp(400, {"error": "Attachment limit reached (5 max)"})
+
+    att_id   = _make_id()
+    blob_key = f"{owner}/{job_id}/attachments/{att_id}/{filename}"
+    now      = _now_iso()
+
+    _upload_blob_bytes(_get_blob_service(), "jobs", blob_key, raw_bytes, content_type)
+
+    attachments.append({
+        "attachment_id": att_id,
+        "filename":      filename,
+        "content_type":  content_type,
+        "size":          len(raw_bytes),
+        "uploaded_at":   now,
+    })
+
+    jobs_container.patch_item(
+        item=f"{owner}_{job_id}",
+        partition_key=owner,
+        patch_operations=[{"op": "set", "path": "/attachments", "value": attachments}],
+    )
+
+    logging.info(
+        "Uploaded attachment job=%s att=%s size=%d", job_id, att_id, len(raw_bytes)
+    )
+    return _resp(201, {"attachment_id": att_id, "filename": filename})
+
+
+@app.route(route="jobs/{job_id}/attachments/{attachment_id}", methods=["GET"])
+def download_attachment(req: func.HttpRequest) -> func.HttpResponse:
+    """Download an attachment as a base64-encoded JSON response."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    job_id        = req.route_params.get("job_id", "")
+    attachment_id = req.route_params.get("attachment_id", "")
+    if not job_id or not attachment_id:
+        return _resp(400, {"error": "Missing job_id or attachment_id"})
+
+    try:
+        job_doc = _get_cosmos_container(COSMOS_JOBS_CONTAINER).read_item(
+            item=f"{owner}_{job_id}", partition_key=owner
+        )
+    except cosmos_exc.CosmosResourceNotFoundError:
+        return _resp(404, {"error": "Not found"})
+
+    attachments = job_doc.get("attachments") or []
+    att = next((a for a in attachments if a["attachment_id"] == attachment_id), None)
+    if not att:
+        return _resp(404, {"error": "Attachment not found"})
+
+    blob_key = f"{owner}/{job_id}/attachments/{attachment_id}/{att['filename']}"
+    raw = _download_blob_bytes(_get_blob_service(), "jobs", blob_key)
+
+    return _resp(200, {
+        "attachment_id": attachment_id,
+        "filename":      att["filename"],
+        "content_type":  att.get("content_type", "application/octet-stream"),
+        "data":          base64.b64encode(raw).decode("ascii"),
+    })
+
+
+@app.route(route="jobs/{job_id}/attachments/{attachment_id}", methods=["DELETE"])
+def delete_attachment(req: func.HttpRequest) -> func.HttpResponse:
+    """Delete an attachment blob and remove it from the job's metadata list."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    job_id        = req.route_params.get("job_id", "")
+    attachment_id = req.route_params.get("attachment_id", "")
+    if not job_id or not attachment_id:
+        return _resp(400, {"error": "Missing job_id or attachment_id"})
+
+    jobs_container = _get_cosmos_container(COSMOS_JOBS_CONTAINER)
+    try:
+        job_doc = jobs_container.read_item(
+            item=f"{owner}_{job_id}", partition_key=owner
+        )
+    except cosmos_exc.CosmosResourceNotFoundError:
+        return _resp(404, {"error": "Not found"})
+
+    attachments = list(job_doc.get("attachments") or [])
+    att = next((a for a in attachments if a["attachment_id"] == attachment_id), None)
+    if not att:
+        return _resp(404, {"error": "Attachment not found"})
+
+    blob_key = f"{owner}/{job_id}/attachments/{attachment_id}/{att['filename']}"
+    _delete_blob(_get_blob_service(), "jobs", blob_key)
+
+    # Read-modify-write to avoid list_remove equality fragility
+    updated = [a for a in attachments if a["attachment_id"] != attachment_id]
+    jobs_container.patch_item(
+        item=f"{owner}_{job_id}",
+        partition_key=owner,
+        patch_operations=[{"op": "set", "path": "/attachments", "value": updated}],
+    )
+
+    return _resp(200, {"attachment_id": attachment_id, "deleted": True})
+
+
 @app.route(route="jobs/{job_id}", methods=["GET"])
 def get_job(req: func.HttpRequest) -> func.HttpResponse:
     """Fetch a job with all artifact text (analysis, description, resume, notes)."""
@@ -635,6 +1041,7 @@ def get_job(req: func.HttpRequest) -> func.HttpResponse:
         "job_id":          item["job_id"],
         "resume_id":       item.get("resume_id"),
         "resume_name":     item.get("resume_name"),
+        "folder_id":       item.get("folder_id"),
         "status":          item.get("status"),
         "status_message":  item.get("error_message"),
         "score":           item.get("score"),
@@ -643,6 +1050,7 @@ def get_job(req: func.HttpRequest) -> func.HttpResponse:
         "source_type":     item.get("source_type"),
         "job_url":         item.get("source_url"),
         "created_at":      item.get("created_at"),
+        "attachments":     item.get("attachments") or [],
         "job_analysis":    _blob_text(blob_service, "jobs", f"{base}/job_analysis.txt"),
         "job_description": _blob_text(blob_service, "jobs", f"{base}/job_description.txt"),
         "resume_snapshot": _blob_text(blob_service, "jobs", f"{base}/resume_snapshot.txt"),
@@ -652,7 +1060,7 @@ def get_job(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="jobs/{job_id}", methods=["DELETE"])
 def delete_job(req: func.HttpRequest) -> func.HttpResponse:
-    """Delete all job artifacts and the Cosmos DB document."""
+    """Delete all job artifacts (including attachments) and the Cosmos document."""
     owner = validate_token(req)
     if not owner:
         return _resp(401, {"error": "Unauthorized"})
@@ -680,10 +1088,85 @@ def delete_job(req: func.HttpRequest) -> func.HttpResponse:
     ):
         _delete_blob(blob_service, "jobs", f"{base}/{artifact}")
 
+    # Delete all attachment blobs under the job prefix
+    _delete_blob_prefix(blob_service, "jobs", f"{base}/attachments/")
+
     container.delete_item(item=f"{owner}_{job_id}", partition_key=owner)
 
     logging.info("Deleted job_id=%s owner=%s", job_id, owner)
     return _resp(200, {"job_id": job_id, "deleted": True})
+
+
+# ================================================================================
+# Usage Route
+# ================================================================================
+
+@app.route(route="usage", methods=["GET"])
+def get_usage(req: func.HttpRequest) -> func.HttpResponse:
+    """Return per-user AOAI token usage and limit."""
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    doc = _get_usage_doc(owner)
+    return _resp(200, {
+        "tokens_used":  doc.get("tokens_used", 0),
+        "token_limit":  doc.get("token_limit", TOKEN_LIMIT_DEFAULT),
+    })
+
+
+# ================================================================================
+# Usage helpers
+# ================================================================================
+
+def _get_usage_doc(owner: str) -> dict:
+    """Fetch or lazily create the usage document for an owner.
+
+    Args:
+        owner: The user's sub claim (partition key).
+
+    Returns:
+        The usage document dict (tokens_used, token_limit).
+    """
+    container = _get_cosmos_container(COSMOS_USERS_CONTAINER)
+    try:
+        return container.read_item(item=f"{owner}_usage", partition_key=owner)
+    except cosmos_exc.CosmosResourceNotFoundError:
+        doc = {
+            "id":          f"{owner}_usage",
+            "owner":       owner,
+            "tokens_used": 0,
+            "token_limit": TOKEN_LIMIT_DEFAULT,
+        }
+        container.create_item(body=doc)
+        return doc
+
+
+def _accumulate_tokens(owner: str, token_count: int) -> None:
+    """Atomically add token_count to the user's lifetime usage total.
+
+    Uses patch_item with an "incr" operation so concurrent requests
+    don't overwrite each other's updates.
+
+    Args:
+        owner:       The user's sub claim.
+        token_count: Number of tokens to add.
+    """
+    _get_usage_doc(owner)  # ensure the doc exists before incrementing
+    container = _get_cosmos_container(COSMOS_USERS_CONTAINER)
+    try:
+        container.patch_item(
+            item=f"{owner}_usage",
+            partition_key=owner,
+            patch_operations=[{
+                "op":    "incr",
+                "path":  "/tokens_used",
+                "value": token_count,
+            }],
+        )
+    except Exception as exc:
+        # Non-fatal — log and continue; usage tracking should never block scoring
+        logging.warning("Failed to accumulate tokens owner=%s: %s", owner, exc)
 
 
 # ================================================================================
@@ -755,12 +1238,11 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
     """Process a resume scoring job from the Service Bus queue.
 
     Fetches or reads the job posting, runs two Azure OpenAI calls to extract
-    metadata then score the resume, writes artifacts to Blob Storage, and
-    updates the Cosmos DB job document.
+    metadata then score the resume, writes artifacts to Blob Storage, updates
+    the Cosmos DB job document, and atomically accumulates token usage.
 
     Raises on hard failure so the Service Bus SDK retries / dead-letters.
-    Soft failures (malformed JSON, API error) update status=Failed so the
-    message is not redelivered for unrecoverable errors.
+    Soft failures update status=Failed so the message is not redelivered.
     """
     raw  = msg.get_body().decode("utf-8")
     data = json.loads(raw)
@@ -803,14 +1285,17 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
                 blob_service, "jobs", f"{base}/job_description.txt"
             )
 
+        total_tokens = 0
+
         # --------------------------------------------------------------------
         # Phase 1: Extract job metadata and clean description
         # --------------------------------------------------------------------
-        extraction = _parse_json(
-            _call_aoai(_EXTRACTION_PROMPT.format(
-                job_posting=raw_job_text[:20000]
-            ))
-        )
+        extraction_resp = _call_aoai(_EXTRACTION_PROMPT.format(
+            job_posting=raw_job_text[:20000]
+        ))
+        total_tokens += extraction_resp["tokens"]
+        extraction = _parse_json(extraction_resp["text"])
+
         job_title    = extraction.get("job_title", "")
         company_name = extraction.get("company_name", "")
         job_text     = extraction.get("job_text", raw_job_text[:20000])
@@ -821,14 +1306,15 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
         # --------------------------------------------------------------------
         # Phase 2: Score resume against job
         # --------------------------------------------------------------------
-        scoring = _parse_json(
-            _call_aoai(_SCORING_PROMPT.format(
-                job_title=job_title,
-                company_name=company_name,
-                job_text=job_text[:10000],
-                resume_text=resume_text[:10000],
-            ))
-        )
+        scoring_resp = _call_aoai(_SCORING_PROMPT.format(
+            job_title=job_title,
+            company_name=company_name,
+            job_text=job_text[:10000],
+            resume_text=resume_text[:10000],
+        ))
+        total_tokens += scoring_resp["tokens"]
+        scoring = _parse_json(scoring_resp["text"])
+
         score      = int(scoring.get("score", 0))
         strengths  = scoring.get("strengths", [])
         weaknesses = scoring.get("weaknesses", [])
@@ -856,7 +1342,13 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
             company_name=company_name,
             score=score,
         )
-        logging.info("Worker: completed job=%s score=%d", job_id, score)
+
+        # Accumulate token usage after scoring completes
+        if total_tokens > 0:
+            _accumulate_tokens(owner, total_tokens)
+
+        logging.info("Worker: completed job=%s score=%d tokens=%d",
+                     job_id, score, total_tokens)
 
     except Exception as exc:
         logging.exception("Worker: failed job=%s: %s", job_id, exc)
@@ -889,14 +1381,17 @@ def _fetch_url(url: str) -> str:
     return soup.get_text(separator="\n", strip=True)[:50000]
 
 
-def _call_aoai(prompt: str) -> str:
+def _call_aoai(prompt: str) -> dict:
     """Call Azure OpenAI chat completions with exponential backoff on 429.
+
+    Returns both the response text and the total token count consumed so the
+    worker can accumulate usage across both scoring phases.
 
     Args:
         prompt: The user message to send.
 
     Returns:
-        The assistant's response text.
+        Dict with "text" (str) and "tokens" (int).
 
     Raises:
         Exception: Re-raises after 4 failed attempts.
@@ -909,7 +1404,13 @@ def _call_aoai(prompt: str) -> str:
                 temperature=0.1,
                 response_format={"type": "json_object"},
             )
-            return response.choices[0].message.content.strip()
+            tokens = 0
+            if response.usage:
+                tokens = (response.usage.total_tokens or 0)
+            return {
+                "text":   response.choices[0].message.content.strip(),
+                "tokens": tokens,
+            }
         except Exception as exc:
             if "429" in str(exc) and attempt < 3:
                 wait = 10 * (2 ** attempt)

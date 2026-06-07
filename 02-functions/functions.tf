@@ -76,10 +76,12 @@ resource "azurerm_function_app_flex_consumption" "resume" {
     ServiceBusConnection__fullyQualifiedNamespace = var.servicebus_namespace_fqdn
 
     # Cosmos DB — RBAC auth via managed identity
-    COSMOS_ENDPOINT            = var.cosmos_endpoint
-    COSMOS_DATABASE_NAME       = "resume-app"
-    COSMOS_RESUMES_CONTAINER   = "resumes"
-    COSMOS_JOBS_CONTAINER      = "jobs"
+    COSMOS_ENDPOINT              = var.cosmos_endpoint
+    COSMOS_DATABASE_NAME         = "resume-app"
+    COSMOS_RESUMES_CONTAINER     = "resumes"
+    COSMOS_JOBS_CONTAINER        = "jobs"
+    COSMOS_FOLDERS_CONTAINER     = "folders"
+    COSMOS_USERS_CONTAINER       = "users"
 
     # Media blob storage — managed identity access via Storage Blob Data Contributor
     MEDIA_BLOB_ENDPOINT = var.media_blob_endpoint

@@ -1,9 +1,9 @@
 /* ========================================================================== */
 /* api.js                                                                      */
 /* HTTP client for the Resume Scorer backend API.                              */
-/* Attaches a fresh Firebase ID token as a Bearer header on every request.   */
-/* On 401, redirects to index.html — Firebase auto-refreshes tokens so a     */
-/* 401 means the session has genuinely ended.                                 */
+/* Attaches a fresh Entra id_token as a Bearer header on every request.      */
+/* On 401, redirects to index.html — Entra tokens are short-lived and the    */
+/* user must re-authenticate when the session expires.                        */
 /* ========================================================================== */
 
 import { CONFIG }     from "./config.js";
@@ -30,7 +30,7 @@ async function apiRequest(path, options = {}) {
     headers,
   });
 
-  // Firebase auto-refreshes tokens, so 401 means the session has expired
+  // Entra tokens are short-lived; 401 means the session has expired.
   if (response.status === 401) {
     window.location.href = "index.html";
     return;
@@ -79,6 +79,63 @@ export async function updateJobNotes(jobId, notes) {
 
 export async function deleteJob(jobId) {
   return apiRequest(`/jobs/${jobId}`, { method: "DELETE" });
+}
+
+export async function moveJobToFolder(jobId, folderId) {
+  return apiRequest(`/jobs/${jobId}/folder`, {
+    method: "PATCH",
+    body:   JSON.stringify({ folder_id: folderId }),
+  });
+}
+
+// -----------------------------------------------------------------------------
+// Usage API
+// -----------------------------------------------------------------------------
+
+export async function getUsage() {
+  return apiRequest("/usage", { method: "GET" });
+}
+
+// -----------------------------------------------------------------------------
+// Attachments API
+// -----------------------------------------------------------------------------
+
+export async function listAttachments(jobId) {
+  return apiRequest(`/jobs/${jobId}/attachments`, { method: "GET" });
+}
+
+export async function uploadAttachment(jobId, filename, contentType, base64Data) {
+  return apiRequest(`/jobs/${jobId}/attachments`, {
+    method: "POST",
+    body:   JSON.stringify({ filename, content_type: contentType, data: base64Data }),
+  });
+}
+
+export async function downloadAttachment(jobId, attachmentId) {
+  return apiRequest(`/jobs/${jobId}/attachments/${attachmentId}`, { method: "GET" });
+}
+
+export async function deleteAttachment(jobId, attachmentId) {
+  return apiRequest(`/jobs/${jobId}/attachments/${attachmentId}`, { method: "DELETE" });
+}
+
+// -----------------------------------------------------------------------------
+// Folders API
+// -----------------------------------------------------------------------------
+
+export async function listFolders() {
+  return apiRequest("/folders", { method: "GET" });
+}
+
+export async function createFolder(payload) {
+  return apiRequest("/folders", {
+    method: "POST",
+    body:   JSON.stringify(payload),
+  });
+}
+
+export async function deleteFolder(folderId) {
+  return apiRequest(`/folders/${folderId}`, { method: "DELETE" });
 }
 
 // -----------------------------------------------------------------------------

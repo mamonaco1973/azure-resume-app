@@ -1,4 +1,4 @@
-# Azure Serverless Resume Scoring Application
+# Azure Serverless Resume Scoring App
 
 This project delivers a fully automated **serverless resume scoring application**
 on Azure, built using **Azure Functions (Flex Consumption)**, **Azure Service Bus**,
