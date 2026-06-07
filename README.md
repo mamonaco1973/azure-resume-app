@@ -53,11 +53,23 @@ models requires only editing one export line in `aoai-config.sh`.
    at idle.
 6. **Infrastructure as Code (IaC)** – Terraform provisions all resources
    across three independent phases for clean separation of concerns.
-7. **Cosmos DB Data Model** – Resumes and jobs stored in separate containers
-   with `{owner}_{resource_id}` document IDs for per-user data isolation.
+7. **Cosmos DB Data Model** – Resumes, jobs, folders, and per-user usage
+   records stored in separate containers with `{owner}_{resource_id}` document
+   IDs for per-user data isolation.
 8. **Browser-Based Frontend** – A static Blob Storage-hosted SPA uses
    sessionStorage for the Entra token and polls `GET /jobs` (5 s auto-refresh)
    to surface scoring results.
+9. **Folder Organization & Filtering** – Jobs can be grouped into named folders
+   with client-side filtering by folder, status, and keyword search.
+   Filter state persists across page reloads via cookies.
+10. **File Attachments** – Up to 5 attachments (10 MB each) can be uploaded per
+    job, stored in Blob Storage and accessible via the job detail modal.
+11. **AOAI Token Tracking** – Per-user cumulative token usage is tracked in
+    Cosmos DB with an atomic `incr` patch. A token ring in the dashboard
+    header shows consumption at a glance; the API enforces a 100 K token cap.
+12. **User Cap Enforcement** – `POST /register` limits the app to 100 users.
+    Returning users are verified with a single Cosmos read; new users trigger a
+    count query before creation.
 
 ## Architecture
 
@@ -177,9 +189,12 @@ When the deployment completes, the following resources are created:
 - **Azure Cosmos DB:**
   - Account: `cosmos-resume-{hex}` (SQL API, serverless-compatible)
   - Database: `resume-app`
-  - Container `resumes` — partition key `/owner`; no TTL (resumes kept
-    indefinitely)
-  - Container `jobs` — partition key `/owner`; default TTL 90 days
+  - Container `resumes` — partition key `/owner`; no TTL
+  - Container `jobs` — partition key `/owner`; default TTL 90 days;
+    includes `folder_id`, `attachments[]`, `attachment_count` fields
+  - Container `folders` — partition key `/owner`; no TTL
+  - Container `users` — partition key `/owner`; no TTL; doc id
+    `{owner}_usage`; tracks `tokens_used` and `token_limit`
   - Document IDs: `{owner}_{resource_id}` for per-user data isolation
   - Custom RBAC role with full read/write permissions (no Cosmos master key
     stored anywhere)
@@ -189,13 +204,17 @@ When the deployment completes, the following resources are created:
   - Python 3.11, 2048 MB instance memory, up to 10 concurrent instances
   - JWT extracted from `Authorization: Bearer` header; `sub` claim used as
     Cosmos DB partition key
-  - **Resume CRUD routes:** POST/GET/PUT/DELETE `/resumes` and
-    `/resumes/{resume_id}`
-  - **Job routes:** POST/GET/DELETE `/jobs` and `/jobs/{job_id}` + PATCH
-    `/jobs/{job_id}/notes`
+  - **Register:** POST `/register` — user-cap enforcement (max 100 users)
+  - **Resume CRUD:** POST/GET/PUT/DELETE `/resumes` and `/resumes/{resume_id}`
+  - **Job routes:** POST/GET/DELETE `/jobs`; GET/DELETE `/jobs/{job_id}`;
+    PATCH `/jobs/{job_id}/notes`; PATCH `/jobs/{job_id}/folder`
+  - **Attachment routes:** GET/POST `/jobs/{job_id}/attachments`;
+    GET/DELETE `/jobs/{job_id}/attachments/{att_id}`
+  - **Folder routes:** GET/POST `/folders`; DELETE `/folders/{folder_id}`
+  - **Usage:** GET `/usage` — per-user AOAI token consumption
   - **`resume_scoring_worker`** — Service Bus trigger; fetches URL or reads
     raw text, strips HTML, runs two-phase GPT-4o scoring, writes blobs,
-    updates Cosmos
+    updates Cosmos; accumulates AOAI token usage atomically
 
 - **Azure Service Bus Standard:**
   - Namespace: `sb-resume-{hex}` (RBAC-only auth, no connection strings)
@@ -222,6 +241,7 @@ When the deployment completes, the following resources are created:
     jobs/{owner}/{job_id}/job_description.txt
     jobs/{owner}/{job_id}/job_analysis.txt
     jobs/{owner}/{job_id}/notes.txt
+    jobs/{owner}/{job_id}/attachments/{att_id}/{filename}
     ```
 
 - **Static Web Application (Blob Storage `$web`):**
@@ -231,11 +251,25 @@ When the deployment completes, the following resources are created:
   - `config.js` (ES module) and `config.json` (PKCE callback) generated at
     deploy time — never edited directly
   - Polls `GET /jobs` every 5 s while any job is pending
+  - Calls `POST /register` on every login; blocks access with a styled
+    alert and signs the user out if the 100-user cap is full
+  - Folder filter, status filter, and keyword search with cookie persistence
+  - Multi-select checkboxes with bulk delete and bulk move-to-folder
+  - Token usage ring in header; color turns red at 80% of the cap
+  - Inline job detail modal with score ring, attachments, notes, and
+    accordion sections for analysis, job description, and resume snapshot
 
 ## Function App API Endpoints
 
 All endpoints require `Authorization: Bearer <JWT>` issued by Entra External ID.
 CORS is restricted to the web storage static website origin.
+
+### Registration & Usage
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/register` | Register user; enforces 100-user cap |
+| GET | `/api/usage` | Return per-user AOAI token consumption |
 
 ### Resumes
 
@@ -251,11 +285,29 @@ CORS is restricted to the web storage static website origin.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/jobs` | Submit a job for scoring (URL or raw text) |
-| GET | `/api/jobs` | List all jobs for the authenticated user |
-| GET | `/api/jobs/{job_id}` | Retrieve a job with score and analysis |
+| POST | `/api/jobs` | Submit a job for scoring (URL, raw text, or LinkedIn ID) |
+| GET | `/api/jobs` | List all jobs (includes `folder_id`, `attachment_count`) |
+| GET | `/api/jobs/{job_id}` | Retrieve a job with score, analysis, and attachments |
 | PATCH | `/api/jobs/{job_id}/notes` | Update user notes on a job |
+| PATCH | `/api/jobs/{job_id}/folder` | Move job to a folder (or clear with `null`) |
 | DELETE | `/api/jobs/{job_id}` | Delete a job and all associated blobs |
+
+### Attachments
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/jobs/{job_id}/attachments` | List attachments for a job |
+| POST | `/api/jobs/{job_id}/attachments` | Upload an attachment (base64 JSON, max 5 files / 10 MB each) |
+| GET | `/api/jobs/{job_id}/attachments/{att_id}` | Download attachment as base64 JSON |
+| DELETE | `/api/jobs/{job_id}/attachments/{att_id}` | Delete an attachment |
+
+### Folders
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/folders` | List all folders for the authenticated user |
+| POST | `/api/folders` | Create a new folder |
+| DELETE | `/api/folders/{folder_id}` | Delete a folder and unassign its jobs |
 
 ### Request & Response Characteristics
 
@@ -324,6 +376,9 @@ CORS is restricted to the web storage static website origin.
 }
 ```
 
+Returns `429 Too Many Requests` if the user has exceeded the 100 K AOAI token
+limit.
+
 **Job Status Values:**
 
 | Status | Meaning |
@@ -348,9 +403,11 @@ after submission until `status` is `Scored` or `Failed`.
   "company": "Acme Corp",
   "status": "Scored",
   "score": 78,
+  "folder_id": "abc123",
   "job_analysis": "Overview: ...\n\nStrengths: ...\n\nWeaknesses: ...",
   "job_description": "We are looking for...",
   "resume_snapshot": "John Smith...",
+  "attachments": [{"att_id": "def456", "filename": "offer.pdf", "size": 42000}],
   "notes": "",
   "created_at": "2025-05-04T12:30:00Z",
   "updated_at": "2025-05-04T12:30:35Z"
@@ -407,12 +464,14 @@ password, then complete email verification if required.
 
 After sign-in you are redirected back to the dashboard via `callback.html`,
 which completes the PKCE code exchange and stores the id_token in sessionStorage.
+The app immediately calls `POST /register` to verify or create your user record.
+If the 100-user cap is full, a dialog is shown and you are signed out.
 
 ### 2. Add a Resume
 
 Before scoring any jobs you need at least one resume on file.
 
-1. Click **Manage Resumes**.
+1. Click the **document icon** in the header to open **Manage Resumes**.
 2. Click **New Resume**, give it a name (e.g. `Software Engineer Resume`), and
    paste the full plain-text content of your resume into the text area.
 3. Click **Create Resume**. The resume text is stored in Blob Storage and the
@@ -421,11 +480,24 @@ Before scoring any jobs you need at least one resume on file.
 You can create multiple resumes (e.g. one tailored for backend roles, one for
 management) and choose between them at scoring time.
 
-### 3. Score a Job
+### 3. Organize with Folders
 
-1. Click **Score New Job**.
+Use folders to group jobs by role type, company, or any category.
+
+1. Click the **folder+ icon** next to the folder filter to create a folder.
+2. Select it from the **folder dropdown** in the filter bar to show only those
+   jobs.
+3. Assign a job to a folder from the **new-job form** or via the **job detail
+   modal**.
+4. To delete a folder, select it in the filter bar and click the **folder-
+   delete icon**. Jobs in the folder are unassigned but not deleted.
+
+### 4. Score a Job
+
+1. Click the **+ icon** in the header to open **Score New Job**.
 2. Select the resume to score against from the **Resume** dropdown.
-3. Choose a **Source Type**:
+3. Optionally assign the job to a **Folder**.
+4. Choose a **Source Type**:
 
    | Source Type | When to use |
    |-------------|-------------|
@@ -433,38 +505,73 @@ management) and choose between them at scoring time.
    | **Paste Job Description** | Paste raw job description text — useful when a URL requires login |
    | **LinkedIn Job IDs** | Enter one or more numeric LinkedIn job IDs (one per line) for batch submission |
 
-4. Click **Submit**. The job is queued in Service Bus and the modal closes.
+5. Click **Submit**. The job is queued in Service Bus and the modal closes.
 
-### 4. Monitor Scoring Progress
+### 5. Monitor Scoring Progress
 
 While a job is being processed:
 
 - The **Status** badge shows `submitted` or `Scoring`.
 - A **spinner and countdown** appear in the toolbar — the list auto-refreshes
   every 5 seconds until all pending jobs reach a terminal state.
-- Click **Refresh** at any time to poll immediately.
+- Click the **refresh icon** at any time to poll immediately.
 
 Scoring typically takes **20–90 seconds** depending on Azure OpenAI response
 time and whether the job URL requires fetching and HTML parsing.
 
-### 5. View the Analysis
+### 6. View the Analysis
 
-Once the status changes to **Scored**, click **Open** to view the full result:
+Once the status changes to **Scored**, click the **job title** to open the
+inline detail modal:
 
-- **Score** — a 0–100 compatibility rating
+- **Score ring** — color-coded compatibility rating (green ≥ 75, amber ≥ 50,
+  red < 50)
 - **Analysis** — Overview, Strengths, and Weaknesses sections generated by
   GPT-4o
 - **Job Description** — the cleaned job text used for scoring
 - **Resume Snapshot** — the version of your resume captured at submission time
   (edits to the resume afterwards do not affect past scores)
+- **Notes** — personal annotations saved in Blob Storage
 
-### 6. Add Notes
+### 7. Attach Files
 
-On the job detail page you can type personal notes (interview prep, recruiter
-contact details, application status) into the **Notes** field and save them.
-Notes are stored in Blob Storage and are private to your account.
+In the job detail modal, use the **Attachments** section to upload supporting
+documents (offer letters, recruiter emails, etc.):
 
-### 7. Delete Jobs
+- Up to **5 attachments** per job, **10 MB** each
+- Files are stored in Blob Storage and transferred as base64 JSON
+- Click the **paperclip icon** on any row in the dashboard for quick download
+  access without opening the full modal
 
-Click **Delete** on any row in the dashboard to permanently remove the job
-record and all associated blobs. This action cannot be undone.
+### 8. Filter and Search
+
+The **filter bar** below the header provides three independent filters that
+stack multiplicatively:
+
+| Filter | What it narrows |
+|--------|-----------------|
+| **Folder** | Show only jobs in the selected folder (or all) |
+| **Status** | Show only jobs with a specific scoring status |
+| **Search** | Keyword match on job title and company name |
+
+Filter state is saved in cookies and restored on next page load.
+
+### 9. Bulk Operations
+
+Select multiple jobs using the **checkboxes** in the leftmost column (or the
+master checkbox in the header):
+
+- **Bulk Delete** — removes all selected jobs and their blobs permanently
+- **Bulk Move** — reassigns all selected jobs to the chosen folder
+
+### 10. Token Usage
+
+The **token ring** in the filter bar shows your cumulative AOAI token
+consumption. The ring turns red at 80% of your 100 K limit. When the limit
+is reached, new job submissions return a `429 Too Many Requests` error.
+
+### 11. Delete Jobs
+
+Open the job detail modal and use the delete action, or select jobs via
+checkboxes and use **Bulk Delete**. Deletion removes the Cosmos DB record and
+all associated blobs. This action cannot be undone.

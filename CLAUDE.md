@@ -78,13 +78,46 @@ Cosmos DB (metadata) + Blob Storage (text content)
     `sub` claim becomes the Cosmos DB partition key
 -   Auth: JWT validated in code against Entra External ID JWKS (cached
     per warm instance); no API Gateway needed
+-   **User cap:** `POST /register` enforces `USER_LIMIT = 100`; returning
+    users short-circuit on a single Cosmos read; new users trigger a
+    cross-partition `COUNT(1)` query; 403 if cap is full
+-   **Token cap:** `POST /jobs` enforces `TOKEN_LIMIT_DEFAULT = 100 000`;
+    429 returned when exceeded
+-   **Token tracking:** `resume_scoring_worker` accumulates AOAI token
+    usage via Cosmos `patch_item` with `"op": "incr"` after both phases
+-   **Route ordering:** sub-routes (`/notes`, `/folder`, `/attachments`)
+    decorated before the generic `/{job_id}` route to avoid Azure
+    Functions routing ambiguity
+
+### API Routes
+
+| Route | Methods | Purpose |
+|-------|---------|---------|
+| `/register` | POST | User-cap enforcement (max 100 users) |
+| `/resumes` | GET, POST | Resume list + create |
+| `/resumes/{resume_id}` | GET, PUT, DELETE | Resume CRUD |
+| `/jobs` | GET, POST | Job list + submit |
+| `/jobs/{job_id}/notes` | PATCH | Update notes |
+| `/jobs/{job_id}/folder` | PATCH | Move job to folder |
+| `/jobs/{job_id}/attachments` | GET, POST | List + upload attachments |
+| `/jobs/{job_id}/attachments/{att_id}` | GET, DELETE | Download + delete attachment |
+| `/jobs/{job_id}` | GET, DELETE | Job detail + delete |
+| `/folders` | GET, POST | Folder list + create |
+| `/folders/{folder_id}` | DELETE | Delete folder (unassigns jobs) |
+| `/usage` | GET | Per-user AOAI token usage |
 
 ### Data Model (Cosmos DB)
 
 Database: `resume-app`
 
 -   `resumes` container — partition key `/owner`; doc id `{owner}_{resume_id}`
--   `jobs` container    — partition key `/owner`; doc id `{owner}_{job_id}`
+-   `jobs` container    — partition key `/owner`; doc id `{owner}_{job_id}`;
+    TTL 90 days; fields include `folder_id`, `attachments[]`,
+    `attachment_count`
+-   `folders` container — partition key `/owner`; no TTL
+-   `users` container   — partition key `/owner`; doc id `{owner}_usage`;
+    fields: `tokens_used`, `token_limit` (default 100 000);
+    used for both per-user token cap and user-count cap (max 100 users)
 
 ### Blob Storage Layout (media account)
 
@@ -94,6 +127,7 @@ Database: `resume-app`
       job_description.txt    (URL-fetched or raw text, then cleaned by AOAI)
       job_analysis.txt       (AOAI scoring result)
       notes.txt              (user annotations)
+      attachments/{att_id}/{filename}   (user file attachments)
 
 ### Key Terraform Variables
 
