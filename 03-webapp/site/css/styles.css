@@ -391,6 +391,11 @@ tr:hover {
   display: none;
 }
 
+.modal.modal-submitting .modal-content {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
 .modal-content {
   background: white;
   padding: 24px;

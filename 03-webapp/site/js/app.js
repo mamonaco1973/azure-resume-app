@@ -160,7 +160,15 @@ function bindUiHandlers() {
       renderNewJobFormErrors(validation.errors);
       return;
     }
-    await submitJobScoringRequest();
+    const submitBtn = document.getElementById("submit-new-job");
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "Submitting..."; }
+    newJobModal?.classList.add("modal-submitting");
+    try {
+      await submitJobScoringRequest();
+    } finally {
+      newJobModal?.classList.remove("modal-submitting");
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = "Submit"; }
+    }
     newJobModal?.classList.add("hidden");
     resetNewJobForm();
     await refreshApp();
