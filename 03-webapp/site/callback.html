@@ -15,20 +15,20 @@
     const error  = params.get("error");
 
     if (error || !code) {
-      sessionStorage.removeItem("pkce_verifier");
-      sessionStorage.removeItem("pkce_state");
+      localStorage.removeItem("pkce_verifier");
+      localStorage.removeItem("pkce_state");
       window.location.href = "index.html";
       return;
     }
 
     // State check prevents CSRF on the redirect
-    const savedState = sessionStorage.getItem("pkce_state");
+    const savedState = localStorage.getItem("pkce_state");
     if (state !== savedState) {
       window.location.href = "index.html";
       return;
     }
 
-    const verifier = sessionStorage.getItem("pkce_verifier");
+    const verifier = localStorage.getItem("pkce_verifier");
 
     let cfg;
     try {
@@ -63,11 +63,11 @@
     }
 
     if (data.id_token) {
-      sessionStorage.setItem("entra_id_token", data.id_token);
+      localStorage.setItem("entra_id_token", data.id_token);
     }
 
-    sessionStorage.removeItem("pkce_verifier");
-    sessionStorage.removeItem("pkce_state");
+    localStorage.removeItem("pkce_verifier");
+    localStorage.removeItem("pkce_state");
     window.location.href = "index.html";
   })();
   </script>

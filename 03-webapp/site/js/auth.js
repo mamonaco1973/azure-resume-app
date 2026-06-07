@@ -1,6 +1,6 @@
 /* ========================================================================== */
 /* auth.js                                                                     */
-/* Entra External ID PKCE auth helpers. Token is stored in sessionStorage     */
+/* Entra External ID PKCE auth helpers. Token is stored in localStorage  */
 /* after the code exchange in callback.html; cleared on sign-out.             */
 /* ========================================================================== */
 
@@ -10,16 +10,20 @@ const TOKEN_KEY    = "entra_id_token";
 const VERIFIER_KEY = "pkce_verifier";
 const STATE_KEY    = "pkce_state";
 
+// localStorage shares auth state across tabs; store would force
+// re-login every time job.html is opened in a new tab.
+const store = localStorage;
+
 // -----------------------------------------------------------------------------
 // Token access
 // -----------------------------------------------------------------------------
 
 export async function getIdToken() {
-  return sessionStorage.getItem(TOKEN_KEY) || "";
+  return store.getItem(TOKEN_KEY) || "";
 }
 
 export function isLoggedIn() {
-  const token = sessionStorage.getItem(TOKEN_KEY);
+  const token = store.getItem(TOKEN_KEY);
   if (!token) return false;
   try {
     const payload = JSON.parse(atob(token.split(".")[1]));
@@ -36,8 +40,8 @@ export function isLoggedIn() {
 export function signIn() {
   const verifier = _generateVerifier();
   const state    = _generateState();
-  sessionStorage.setItem(VERIFIER_KEY, verifier);
-  sessionStorage.setItem(STATE_KEY,    state);
+  store.setItem(VERIFIER_KEY, verifier);
+  store.setItem(STATE_KEY,    state);
 
   _codeChallenge(verifier).then((challenge) => {
     const params = new URLSearchParams({
@@ -56,9 +60,9 @@ export function signIn() {
 }
 
 export function signOut() {
-  sessionStorage.removeItem(TOKEN_KEY);
-  sessionStorage.removeItem(VERIFIER_KEY);
-  sessionStorage.removeItem(STATE_KEY);
+  store.removeItem(TOKEN_KEY);
+  store.removeItem(VERIFIER_KEY);
+  store.removeItem(STATE_KEY);
   const post = encodeURIComponent(
     `${window.location.origin}/index.html`
   );
@@ -71,14 +75,14 @@ export function signOut() {
 // -----------------------------------------------------------------------------
 
 export function onAuthChange(callback) {
-  // Fires once synchronously — sessionStorage is available immediately,
+  // Fires once synchronously — store is available immediately,
   // no async restoration needed (unlike Firebase)
-  callback(isLoggedIn() ? { token: sessionStorage.getItem(TOKEN_KEY) } : null);
+  callback(isLoggedIn() ? { token: store.getItem(TOKEN_KEY) } : null);
 }
 
 export function waitForUser() {
   return Promise.resolve(
-    isLoggedIn() ? { token: sessionStorage.getItem(TOKEN_KEY) } : null
+    isLoggedIn() ? { token: store.getItem(TOKEN_KEY) } : null
   );
 }
 
