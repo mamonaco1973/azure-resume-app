@@ -54,7 +54,7 @@ resource "azurerm_cosmosdb_sql_container" "resumes" {
 }
 
 # ------------------------------------------------------------------------------
-# Jobs container — 90-day TTL matches the GCP app retention window
+# Jobs container — no TTL; jobs are retained indefinitely
 # ------------------------------------------------------------------------------
 resource "azurerm_cosmosdb_sql_container" "jobs" {
   name                = "jobs"
@@ -63,7 +63,7 @@ resource "azurerm_cosmosdb_sql_container" "jobs" {
   database_name       = azurerm_cosmosdb_sql_database.resume.name
   partition_key_paths = ["/owner"]
 
-  default_ttl = 7776000 # 90 days
+  default_ttl = -1
 
   throughput = 400
 
