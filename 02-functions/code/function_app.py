@@ -66,6 +66,7 @@ SB_QUEUE_NAME     = os.environ["SERVICEBUS_QUEUE_NAME"]
 
 JOB_RETENTION_DAYS   = 90
 TOKEN_LIMIT_DEFAULT  = 100_000
+USER_LIMIT           = 100
 ATTACHMENT_MAX_FILES = 5
 ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
@@ -1095,6 +1096,58 @@ def delete_job(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info("Deleted job_id=%s owner=%s", job_id, owner)
     return _resp(200, {"job_id": job_id, "deleted": True})
+
+
+# ================================================================================
+# Register Route
+# Enforces USER_LIMIT by counting distinct users before creating a new record.
+# Returning users short-circuit immediately on the first read.
+# ================================================================================
+
+@app.route(route="register", methods=["POST"])
+def register(req: func.HttpRequest) -> func.HttpResponse:
+    """Register or verify the authenticated user against the cap.
+
+    Idempotent: returns 200 if already registered, 201 if newly registered,
+    or 403 if the USER_LIMIT has been reached.
+
+    Returns:
+        200 if the user already exists.
+        201 if the user was just created.
+        403 if the user cap is full.
+    """
+    owner = validate_token(req)
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+
+    container = _get_cosmos_container(COSMOS_USERS_CONTAINER)
+
+    # Returning user — skip the count query entirely
+    try:
+        container.read_item(item=f"{owner}_usage", partition_key=owner)
+        return _resp(200, {"status": "ok"})
+    except cosmos_exc.CosmosResourceNotFoundError:
+        pass
+
+    # New user — count all existing user docs before creating
+    counts = list(container.query_items(
+        query="SELECT VALUE COUNT(1) FROM c",
+        enable_cross_partition_query=True,
+    ))
+    total = counts[0] if counts else 0
+    if total >= USER_LIMIT:
+        logging.warning("register: user cap reached (%d)", total)
+        return _resp(403, {"error": "User limit reached"})
+
+    doc = {
+        "id":          f"{owner}_usage",
+        "owner":       owner,
+        "tokens_used": 0,
+        "token_limit": TOKEN_LIMIT_DEFAULT,
+    }
+    container.create_item(body=doc)
+    logging.info("register: new user owner=%s total=%d", owner, total + 1)
+    return _resp(201, {"status": "created"})
 
 
 # ================================================================================

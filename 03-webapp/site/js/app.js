@@ -4,7 +4,7 @@
 /* form, resume selector, folder management, and job list on DOMContentLoaded.*/
 /* ========================================================================== */
 
-import { createJob, listResumes, getUsage,
+import { register, createJob, listResumes, getUsage,
          listFolders, createFolder, deleteFolder } from "./api.js";
 import { loadJobs, hasPendingJobs,
          setFolderFilter, setStatusFilter,
@@ -29,6 +29,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (!isLoggedIn()) {
     showNotLoggedInMessage();
     return;
+  }
+
+  // Enforce user cap before loading the dashboard. 403 means the app is full.
+  try {
+    await register();
+  } catch (error) {
+    if (error.message && error.message.includes("User limit reached")) {
+      await showAlert(
+        "This app has reached its user limit. Please contact mamonaco1973@gmail.com.",
+        { title: "Access Denied" }
+      );
+      signOut();
+      return;
+    }
   }
 
   try {
