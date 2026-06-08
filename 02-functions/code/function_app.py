@@ -1366,15 +1366,12 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
                 blob_service, "jobs", f"{base}/job_description.txt"
             )
 
-        total_tokens = 0
-
         # --------------------------------------------------------------------
         # Phase 1: Extract job metadata and clean description
         # --------------------------------------------------------------------
         extraction_resp = _call_aoai(_EXTRACTION_PROMPT.format(
             job_posting=raw_job_text[:20000]
         ))
-        total_tokens += extraction_resp["tokens"]
         extraction = _parse_json(extraction_resp["text"])
 
         job_title    = extraction.get("job_title", "")
@@ -1383,6 +1380,25 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
 
         # Overwrite job_description.txt with the cleaned AOAI-extracted text
         _upload_blob(blob_service, "jobs", f"{base}/job_description.txt", job_text)
+
+        # Accumulate Phase 1 tokens immediately so the mid-batch re-check
+        # below reflects reality for concurrent or sequential sibling jobs.
+        if extraction_resp["tokens"] > 0:
+            _accumulate_tokens(owner, extraction_resp["tokens"])
+
+        # Re-check token limit between phases — Phase 1 may have pushed the
+        # user over budget since the guard at the top of the worker ran.
+        usage = _get_usage_doc(owner)
+        if usage.get("tokens_used", 0) >= usage.get("token_limit", TOKEN_LIMIT_DEFAULT):
+            logging.warning(
+                "Worker: token limit exceeded after extraction, skipping "
+                "scoring. job=%s owner=%s", job_id, owner,
+            )
+            _update_job(
+                status="Failed",
+                error_message="Token limit reached. This job was not scored.",
+            )
+            return
 
         # --------------------------------------------------------------------
         # Phase 2: Score resume against job
@@ -1393,7 +1409,11 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
             job_text=job_text[:10000],
             resume_text=resume_text[:10000],
         ))
-        total_tokens += scoring_resp["tokens"]
+
+        # Accumulate Phase 2 tokens before writing results
+        if scoring_resp["tokens"] > 0:
+            _accumulate_tokens(owner, scoring_resp["tokens"])
+
         scoring = _parse_json(scoring_resp["text"])
 
         score      = int(scoring.get("score", 0))
@@ -1424,12 +1444,11 @@ def resume_scoring_worker(msg: func.ServiceBusMessage) -> None:
             score=score,
         )
 
-        # Accumulate token usage after scoring completes
-        if total_tokens > 0:
-            _accumulate_tokens(owner, total_tokens)
-
-        logging.info("Worker: completed job=%s score=%d tokens=%d",
-                     job_id, score, total_tokens)
+        logging.info(
+            "Worker: completed job=%s score=%d tokens=%d",
+            job_id, score,
+            extraction_resp["tokens"] + scoring_resp["tokens"],
+        )
 
     except Exception as exc:
         logging.exception("Worker: failed job=%s: %s", job_id, exc)

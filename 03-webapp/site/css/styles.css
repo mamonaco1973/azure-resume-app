@@ -392,7 +392,6 @@ tr:hover {
 }
 
 .modal.modal-submitting .modal-content {
-  opacity: 0.6;
   pointer-events: none;
 }
 
