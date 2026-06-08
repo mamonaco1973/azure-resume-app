@@ -483,6 +483,10 @@ main.table-busy,
   resize: vertical;
 }
 
+#linkedin-job-ids {
+  height: 120px;
+}
+
 .modal-actions {
   margin-top: 16px;
   display: flex;
