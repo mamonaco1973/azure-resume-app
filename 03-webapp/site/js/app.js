@@ -163,11 +163,19 @@ function bindUiHandlers() {
     const submitBtn = document.getElementById("submit-new-job");
     if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "Submitting..."; }
     newJobModal?.classList.add("modal-submitting");
+    let submitError = null;
     try {
       await submitJobScoringRequest();
+    } catch (err) {
+      submitError = err.message || "Submission failed. Please try again.";
     } finally {
       newJobModal?.classList.remove("modal-submitting");
       if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = "Submit"; }
+    }
+    if (submitError) {
+      const errEl = document.getElementById("new-job-submit-error");
+      if (errEl) { errEl.textContent = submitError; errEl.classList.remove("hidden"); }
+      return;
     }
     newJobModal?.classList.add("hidden");
     resetNewJobForm();
@@ -337,6 +345,8 @@ async function populateResumeSelect() {
 /* -------------------------------------------------------------------------- */
 function resetNewJobForm() {
   document.getElementById("new-job-form")?.reset();
+  const errEl = document.getElementById("new-job-submit-error");
+  if (errEl) { errEl.textContent = ""; errEl.classList.add("hidden"); }
   const savedSourceType = getCookie("jobFilter_sourceType") || "linkedin_job_id";
   document.getElementById("source-type").value = savedSourceType;
   document.getElementById("job-url").value = "";
@@ -376,6 +386,7 @@ function validateNewJobForm() {
   if (sourceType === "linkedin_job_id") {
     const ids = parseLinkedInJobIds(linkedinRaw);
     if (!ids.length)                         errors.linkedinJobIds = "Enter at least one LinkedIn job ID.";
+    else if (ids.length > 10)                errors.linkedinJobIds = "You can submit at most 10 LinkedIn job IDs at once.";
     else if (!ids.every(isValidLinkedInJobId)) errors.linkedinJobIds = "Each LinkedIn Job ID must be numeric and 7 to 12 digits long.";
   }
   return { isValid: Object.keys(errors).length === 0, errors };

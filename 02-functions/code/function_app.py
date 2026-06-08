@@ -705,10 +705,19 @@ def create_job(req: func.HttpRequest) -> func.HttpResponse:
             400, {"error": "job_description is required for source_type=raw_text"}
         )
 
+    # Reject if user has hit the lifetime job cap
+    job_count_result = list(_get_cosmos_container(COSMOS_JOBS_CONTAINER).query_items(
+        query="SELECT VALUE COUNT(1) FROM c WHERE c.owner = @owner",
+        parameters=[{"name": "@owner", "value": owner}],
+        enable_cross_partition_query=False,
+    ))
+    if job_count_result and job_count_result[0] >= 1000:
+        return _resp(429, {"error": "Job limit reached. Maximum 1,000 scored jobs per account."})
+
     # Enforce token cap before queuing the job
     usage = _get_usage_doc(owner)
     if usage.get("tokens_used", 0) >= usage.get("token_limit", TOKEN_LIMIT_DEFAULT):
-        return _resp(429, {"error": "token_limit_exceeded"})
+        return _resp(429, {"error": "Token limit reached. Please contact the administrator."})
 
     # Load resume metadata and text
     try:

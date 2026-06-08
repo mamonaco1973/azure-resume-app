@@ -442,6 +442,16 @@ main.table-busy,
   margin-top: 6px;
 }
 
+.form-error {
+  background: #fdecea;
+  border: 1px solid #e57373;
+  border-radius: 4px;
+  color: #b33434;
+  font-size: 13px;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+}
+
 .field-success {
   color: #1b7a3c;
   font-size: 13px;
