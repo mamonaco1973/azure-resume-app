@@ -1,577 +1,177 @@
-# Azure Serverless Resume Scoring App
+# Resume Scorer on Azure: Entra External ID, Functions, Service Bus and Azure OpenAI
 
-This project delivers a fully automated **serverless resume scoring application**
-on Azure, built using **Azure Functions (Flex Consumption)**, **Azure Service Bus**,
-**Cosmos DB**, **Azure Blob Storage**, and **Azure OpenAI Service (GPT-4o)**.
+A serverless **resume scoring** app. Users sign in with **Microsoft Entra
+External ID**, store one or more resumes, and submit job postings as a URL,
+pasted text, or LinkedIn job IDs. HTTP functions in a **Flex Consumption
+Function App** queue each job on **Service Bus**, and a queue-triggered
+function in the same app fetches the posting, has **gpt-4o on Azure OpenAI**
+extract the job details and score the resume from 0 to 100, and writes an
+analysis split into strengths and weaknesses. Data lives in **Cosmos DB** and
+**Blob Storage**, and a vanilla JavaScript single-page app on a storage
+static website ties it together.
 
-It uses **Terraform** and **Python** to provision and deploy an
-**asynchronous, AI-powered scoring pipeline** secured with **JWT-based
-authentication**, allowing users to upload resumes and submit job postings for
-compatibility scoring — all without running or managing any virtual machines.
+![Resume Scorer web app](webapp.png)
 
-Users submit a resume and a job posting (as a URL, raw text, or LinkedIn job
-ID). The application uses **Azure OpenAI GPT-4o** to extract structured job
-metadata and score the resume against the job on a scale of 0–100, with a
-written analysis broken into **Strengths** and **Weaknesses** sections.
-
-Authentication and authorization are handled by **Microsoft Entra External ID**
-(PKCE flow). Users click **Sign In** and are redirected to the Entra hosted
-sign-in page; the resulting JWT is validated directly in the Function App code.
-
-![webapp](webapp.png)
-
-A **vanilla JavaScript single-page application** hosted on Azure Blob Storage
-static website interacts directly with the Function App API, allowing
-authenticated users to manage resumes, submit jobs for scoring, and review
-AI-generated analysis from a browser.
-
-This design follows a **serverless event-driven architecture** where the
-Function App routes authenticated requests, Service Bus decouples job
-submission from scoring, and Azure OpenAI handles inference on demand — with
-Azure managing scaling, availability, and fault tolerance automatically.
-
-The GPT-4o model deployment is fully parameterized — see
-[Changing the Azure OpenAI Model](#changing-the-azure-openai-model). Swapping
-models requires only editing one export line in `aoai-config.sh`.
-
-## Key Capabilities Demonstrated
-
-1. **AI-Powered Resume Scoring** – Azure OpenAI GPT-4o extracts job metadata
-   and scores resume-to-job compatibility (0–100) with a written
-   Strengths/Weaknesses analysis.
-2. **Asynchronous Job Processing** – Service Bus decouples job submission from
-   scoring. The API returns immediately with a `submitted` status while a
-   Service Bus trigger processes the job in the background.
-3. **Entra External ID PKCE Auth** – Login redirects to the Entra hosted UI;
-   JWT validated in Function App code against the Entra JWKS endpoint. No
-   API Gateway or custom auth middleware required.
-4. **Managed Identity for All Services** – Function App accesses Cosmos DB,
-   Service Bus, Blob Storage, and Azure OpenAI via `DefaultAzureCredential`
-   with RBAC role assignments. No API keys in application settings.
-5. **Serverless Event-Driven Architecture** – No VMs, containers, or VPC
-   networking required. Azure Functions FC1 scale on demand and cost nothing
-   at idle.
-6. **Infrastructure as Code (IaC)** – Terraform provisions all resources
-   across three independent phases for clean separation of concerns.
-7. **Cosmos DB Data Model** – Resumes, jobs, folders, and per-user usage
-   records stored in separate containers with `{owner}_{resource_id}` document
-   IDs for per-user data isolation.
-8. **Browser-Based Frontend** – A static Blob Storage-hosted SPA uses
-   sessionStorage for the Entra token and polls `GET /jobs` (5 s auto-refresh)
-   to surface scoring results.
-9. **Folder Organization & Filtering** – Jobs can be grouped into named folders
-   with client-side filtering by folder, status, and keyword search.
-   Filter state persists across page reloads via cookies.
-10. **File Attachments** – Up to 5 attachments (10 MB each) can be uploaded per
-    job, stored in Blob Storage and accessible via the job detail modal.
-11. **AOAI Token Tracking** – Per-user cumulative token usage is tracked in
-    Cosmos DB with an atomic `incr` patch. A token ring in the dashboard
-    header shows consumption at a glance; the API enforces a 100 K token cap.
-12. **User Cap Enforcement** – `POST /register` limits the app to 100 users.
-    Returning users are verified with a single Cosmos read; new users trigger a
-    count query before creation.
+| Piece | Where | Role |
+|---|---|---|
+| **resume-app** | Entra External ID tenant | SPA app registration (authorization code with PKCE); `apply.sh` adds it to your sign-up/sign-in user flow |
+| **resume-func-&lt;hex&gt;** | `resume-app-rg`, Central US | Function App on the `FC1` plan, Python 3.11, up to 10 instances of 2 GB; anonymous HTTP functions that validate the bearer token themselves, plus `resume_scoring_worker`; system-assigned managed identity; CORS allows only the web origin |
+| **resume-aoai-&lt;hex&gt;** | Azure OpenAI, S0 | deployment `gpt-4o` (model version `2024-11-20`), GlobalStandard, 100K tokens per minute |
+| **sb-resume-&lt;hex&gt;** | Service Bus, Standard | local (key) auth disabled; queue `resume-scoring-jobs`: 5 min lock, 5 delivery attempts, 90 day TTL, dead-letters expired messages |
+| **cosmos-resume-&lt;hex&gt;** | Cosmos DB | database `resume-app` with `resumes`, `jobs`, `folders` and `users`, each partitioned on `/owner` at 400 RU/s |
+| **resumemedia&lt;hex&gt;** | Storage | private containers `resumes` and `jobs`: resume text, job descriptions, analyses and attachments |
+| **resumeweb&lt;hex&gt;** | Storage | static website with the SPA and a generated `js/config.js` |
+| **resumefunc&lt;hex&gt;** / **resume-ai-&lt;hex&gt;** | `resume-app-rg` | deployment package storage, and Application Insights |
 
 ## Architecture
 
-![diagram](azure-resume-app.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="architecture-dark.svg">
+  <img alt="A browser loads the single-page app from the resumeweb storage static website and signs in through an Entra External ID user flow. It calls the Flex Consumption Function App, whose HTTP functions validate the Entra token and keep resumes, jobs, folders and users in Cosmos DB and resume text, analyses and attachments in the media storage account. Submitting a job sends it to the resume-scoring-jobs Service Bus queue. A queue-triggered worker in the same app fetches the posting, calls gpt-4o on Azure OpenAI to extract the job and score the resume, and writes the analysis to storage and the status and token usage to Cosmos DB. The app reaches every service with its managed identity." src="architecture-light.svg">
+</picture>
+
+Regenerate with `python3 make_diagram.py`.
+
+- **`01-backend/`**: the resource group, the Entra app registration (applied
+  with a service principal in the External tenant), Azure OpenAI and its
+  deployment, Service Bus, Cosmos DB and both storage accounts.
+- **`02-functions/`**: the Function App, its storage, plan and Application
+  Insights, its role assignments, and all the functions in
+  `code/function_app.py`.
+- **`03-webapp/`**: the SPA in `site/`, uploaded to the static website.
+- **`aoai-config.sh`**: the model deployment name, sourced by `apply.sh` and
+  `destroy.sh`.
+
+No keys are stored in app settings: the app's managed identity has Service
+Bus Data Sender and Receiver on the queue, Storage Blob Data Contributor on
+the media account, Cognitive Services OpenAI User on Azure OpenAI, and a
+custom Cosmos DB data role.
+
+## How a job is scored
+
+1. The browser signs in through the user flow and sends the access token as
+   a bearer token. Each function checks it against the tenant's
+   `ciamlogin.com` keys with the `resume-app` client ID as audience, and
+   uses the `sub` claim as the owner.
+2. On first sign-in the page calls `POST /api/register`, which creates the
+   user record, up to a cap of 100 users.
+3. `POST /api/jobs` checks the user is under their token limit, saves the
+   job, and sends it to the queue. LinkedIn job IDs become one job each.
+4. The worker fetches the URL (or uses the pasted text), strips it to
+   visible text with BeautifulSoup, and calls gpt-4o once to extract the
+   title, company and other fields and again to score the resume. It stores
+   the analysis in Blob Storage, marks the job `Scored`, and adds the tokens
+   to the user's total.
+5. If anything fails, it marks the job `Failed` with a message and raises,
+   so Service Bus redelivers the message, up to 5 times.
+
+The default limit is 100,000 tokens per user for the account's lifetime.
+
+## API
+
+Every route is under `/api` and needs `Authorization: Bearer <access
+token>`; everything is scoped to the token's user.
+
+| Area | Routes |
+|---|---|
+| Resumes | `POST /resumes`, `GET /resumes`, `GET`/`PUT`/`DELETE /resumes/{resume_id}` |
+| Jobs | `POST /jobs` (URL, raw text or LinkedIn IDs), `GET /jobs`, `GET`/`DELETE /jobs/{job_id}`, `PATCH /jobs/{job_id}/notes`, `PATCH /jobs/{job_id}/folder` |
+| Attachments | `GET`/`POST /jobs/{job_id}/attachments`, `GET`/`DELETE /jobs/{job_id}/attachments/{attachment_id}`; base64 JSON, up to 10 MB each and 5 per job |
+| Folders | `POST /folders`, `GET /folders`, `DELETE /folders/{folder_id}` (its jobs become unassigned) |
+| Account | `POST /register`, `GET /usage` |
 
 ## Prerequisites
 
-* [An Azure Subscription](https://portal.azure.com/) with billing enabled
-* [Install Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+* [An Azure Account](https://portal.azure.com/) with Azure OpenAI quota for
+  gpt-4o GlobalStandard in Central US
+* [Install AZ CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 * [Install Terraform](https://developer.hashicorp.com/terraform/install)
-* [Install jq](https://jqlang.github.io/jq/download/)
-* [Install zip](https://gnuwin32.sourceforge.net/packages/zip.htm) (or equivalent)
-* [Install envsubst](https://www.gnu.org/software/gettext/) (part of `gettext`)
-* A **service principal** with `Contributor` + `User Access Administrator`
-  roles on the subscription (for Terraform + RBAC assignments)
-* A **Microsoft Entra External ID tenant** with a self-service sign-up user
-  flow configured
-
-## Required Environment Variables
-
-Export the following before running any scripts:
+* [Install jq](https://jqlang.github.io/jq/download/), `zip` and `envsubst`
+* A service principal with **Contributor** and **User Access
+  Administrator** on the subscription (Terraform creates role assignments)
+* A **Microsoft Entra External ID tenant** with a sign-up/sign-in user flow,
+  and a service principal in that tenant with the Microsoft Graph
+  application permissions `Application.ReadWrite.All` and
+  `EventListener.ReadWrite.All` (admin consent granted); see
+  [azure-cartoonify](https://github.com/mamonaco1973/azure-cartoonify#one-time-entra-external-id-setup)
+  for the portal steps
 
 ```bash
-# Azure service principal — used by Terraform (azurerm provider)
-export ARM_CLIENT_ID="<sp-client-id>"
-export ARM_CLIENT_SECRET="<sp-client-secret>"
-export ARM_TENANT_ID="<arm-tenant-id>"
-export ARM_SUBSCRIPTION_ID="<subscription-id>"
+# Subscription
+export ARM_CLIENT_ID="..."
+export ARM_CLIENT_SECRET="..."
+export ARM_TENANT_ID="..."
+export ARM_SUBSCRIPTION_ID="..."
 
-# Entra External ID tenant — used by Terraform (azuread provider) and
-# apply.sh (Graph API user flow association)
-export ENTRA_TENANT_ID="<external-tenant-id>"
+# Entra External ID
+export ENTRA_TENANT_ID="..."
 export ENTRA_TENANT_NAME="<external-tenant-name>.onmicrosoft.com"
-export ENTRA_SP_CLIENT_ID="<entra-sp-client-id>"
-export ENTRA_SP_CLIENT_SECRET="<entra-sp-client-secret>"
-export ENTRA_USER_FLOW_NAME="<user-flow-display-name>"
+export ENTRA_SP_CLIENT_ID="..."
+export ENTRA_SP_CLIENT_SECRET="..."
+export ENTRA_USER_FLOW_NAME="..."
 ```
 
-The ARM and ENTRA service principals may be the same SP if it has access to
-both tenants, or different SPs scoped to their respective tenants.
+If this is your first time following along, we recommend starting with this
+video: [Azure + Terraform: Easy Setup](https://youtu.be/wwi3kVgYNOk).
 
-## Download this Repository
+## Deploy
 
 ```bash
 git clone https://github.com/mamonaco1973/azure-resume-app.git
 cd azure-resume-app
+./apply.sh
 ```
 
-## Build the Code
+`apply.sh`:
 
-Run [check_env.sh](check_env.sh) to validate your environment, then run
-[apply.sh](apply.sh) to provision all infrastructure and deploy the frontend.
+1. Applies **`01-backend`**.
+2. Gets a Microsoft Graph token as the External tenant's service principal
+   and adds `resume-app` to the user flow, retrying while the new app
+   propagates.
+3. Applies **`02-functions`**, zips `02-functions/code` and deploys it with
+   a remote build, retrying if the deployment fails.
+4. Renders `js/config.js` (API URL, client ID, authority) and applies
+   **`03-webapp`**.
 
-```bash
-~/azure-resume-app$ ./apply.sh
-NOTE: Running environment validation...
-NOTE: Validating that required commands are found in your PATH.
-NOTE: az is found in the current PATH.
-NOTE: terraform is found in the current PATH.
-NOTE: jq is found in the current PATH.
-NOTE: zip is found in the current PATH.
-NOTE: envsubst is found in the current PATH.
-NOTE: All required environment variables are set.
-NOTE: Azure login successful.
-NOTE: Entra user flow found: <user-flow-display-name>
-NOTE: Deploying backend infrastructure...
-NOTE: Deploying Function App...
-NOTE: Packaging and deploying function code...
-NOTE: Generating frontend config...
-NOTE: Deploying web app...
+It ends by running `validate.sh`, which prints the URL:
 
+```
 =================================================================================
   Resume Scorer — Deployment validated!
 =================================================================================
-  App : https://resumeweb<hex>.z9.web.core.windows.net/index.html
+  Web : https://resumeweb<hex>.z19.web.core.windows.net/index.html
 =================================================================================
 ```
 
-`apply.sh` performs the following steps in order:
+To use another model, change `AOAI_MODEL_DEPLOYMENT` in `aoai-config.sh`;
+the deployment in `01-backend/aoai.tf` also names the model and version.
 
-1. Sources `aoai-config.sh` to set `AOAI_MODEL_DEPLOYMENT`
-2. Runs `check_env.sh` to validate CLI tools, env vars, Azure login, and Entra
-   user flow connectivity
-3. Runs `terraform apply` on `01-backend` — provisions Service Bus, Cosmos DB,
-   Blob Storage accounts, Azure OpenAI, and Entra app registration
-4. Associates the Entra app registration with the user flow via Graph API
-   (retried up to 10 times)
-5. Runs `terraform apply` on `02-functions` — deploys the Function App,
-   Application Insights, and all RBAC role assignments
-6. Packages `02-functions/code/` as a zip and deploys it to the Function App
-   (retried up to 10 times for SCM initialization)
-7. Generates `03-webapp/site/js/config.js` (ES module) and
-   `03-webapp/site/config.json` (PKCE callback config) from Terraform outputs
-8. Runs `terraform apply` on `03-webapp` — uploads all site files to the
-   `$web` container of the web storage account
-9. Runs `validate.sh` to print the live URLs
+## Try it
 
-### Build Results
+1. Open the **Web** URL, sign in, and create an account in the user flow
+   with your email.
+2. Open **Manage Resumes**, create a resume, and paste in its text.
+3. Choose **Score New Job**, pick the resume and optionally a folder, and
+   give the job as a URL, pasted description, or LinkedIn job IDs (one per
+   line). The dashboard refreshes while jobs are pending.
+4. Once a job shows **Scored**, open it to read the score, the strengths and
+   weaknesses, and the extracted details. Add notes, move it to a folder, or
+   attach files.
 
-When the deployment completes, the following resources are created:
-
-- **Core Infrastructure:**
-  - Fully serverless architecture — no VMs, containers, or VPC networking
-  - Three independent Terraform state phases for clean separation of concerns
-  - Asynchronous scoring pipeline decoupled via Service Bus
-
-- **Security, Identity & Access Management:**
-  - **Microsoft Entra External ID** — managed PKCE sign-in with hosted UI;
-    no custom login form in the app
-  - JWT validated in Function App code against the Entra JWKS endpoint; no
-    API Gateway or custom auth middleware
-  - **Managed identity** for Function App with RBAC assignments to all
-    downstream services — no API keys stored in application settings
-  - Dedicated service principal for Terraform; separate SP scoped to the
-    Entra External tenant for Graph API calls
-
-- **Azure Cosmos DB:**
-  - Account: `cosmos-resume-{hex}` (SQL API, serverless-compatible)
-  - Database: `resume-app`
-  - Container `resumes` — partition key `/owner`; no TTL
-  - Container `jobs` — partition key `/owner`; default TTL 90 days;
-    includes `folder_id`, `attachments[]`, `attachment_count` fields
-  - Container `folders` — partition key `/owner`; no TTL
-  - Container `users` — partition key `/owner`; no TTL; doc id
-    `{owner}_usage`; tracks `tokens_used` and `token_limit`
-  - Document IDs: `{owner}_{resource_id}` for per-user data isolation
-  - Custom RBAC role with full read/write permissions (no Cosmos master key
-    stored anywhere)
-
-- **Azure Functions (Flex Consumption FC1):**
-  - Single `function_app.py` with all HTTP routes and the Service Bus trigger
-  - Python 3.11, 2048 MB instance memory, up to 10 concurrent instances
-  - JWT extracted from `Authorization: Bearer` header; `sub` claim used as
-    Cosmos DB partition key
-  - **Register:** POST `/register` — user-cap enforcement (max 100 users)
-  - **Resume CRUD:** POST/GET/PUT/DELETE `/resumes` and `/resumes/{resume_id}`
-  - **Job routes:** POST/GET/DELETE `/jobs`; GET/DELETE `/jobs/{job_id}`;
-    PATCH `/jobs/{job_id}/notes`; PATCH `/jobs/{job_id}/folder`
-  - **Attachment routes:** GET/POST `/jobs/{job_id}/attachments`;
-    GET/DELETE `/jobs/{job_id}/attachments/{att_id}`
-  - **Folder routes:** GET/POST `/folders`; DELETE `/folders/{folder_id}`
-  - **Usage:** GET `/usage` — per-user AOAI token consumption
-  - **`resume_scoring_worker`** — Service Bus trigger; fetches URL or reads
-    raw text, strips HTML, runs two-phase GPT-4o scoring, writes blobs,
-    updates Cosmos; accumulates AOAI token usage atomically
-
-- **Azure Service Bus Standard:**
-  - Namespace: `sb-resume-{hex}` (RBAC-only auth, no connection strings)
-  - Queue: `resume-scoring-jobs` (lock 5 min, TTL 90 days, max delivery 5)
-  - Function App holds both `Azure Service Bus Data Sender` and
-    `Azure Service Bus Data Receiver` roles
-
-- **Azure OpenAI Service:**
-  - Account: `resume-aoai-{hex}` (kind=OpenAI, S0, custom subdomain required
-    for managed identity auth)
-  - Deployment: `gpt-4o` (version 2024-11-20, GlobalStandard, 100K TPM)
-  - Two-phase scoring: extraction call → scoring call; both use
-    `response_format={"type": "json_object"}` for reliable JSON output
-  - Function App holds `Cognitive Services OpenAI User` role
-  - 429 rate-limit backoff: 10 s → 20 s → 40 s
-
-- **Azure Blob Storage:**
-  - **Web account** (`resumeweb{hex}`) — static website hosting for the SPA
-  - **Media account** (`resumemedia{hex}`) — private; accessed server-side
-    via managed identity (`Storage Blob Data Contributor`):
-    ```
-    resumes/{owner}/{resume_id}.txt
-    jobs/{owner}/{job_id}/resume_snapshot.txt
-    jobs/{owner}/{job_id}/job_description.txt
-    jobs/{owner}/{job_id}/job_analysis.txt
-    jobs/{owner}/{job_id}/notes.txt
-    jobs/{owner}/{job_id}/attachments/{att_id}/{filename}
-    ```
-
-- **Static Web Application (Blob Storage `$web`):**
-  - Vanilla JavaScript SPA with no build step or framework dependencies
-  - Entra PKCE: Sign In redirects to Entra hosted UI; `callback.html`
-    completes the code exchange and stores the id_token in sessionStorage
-  - `config.js` (ES module) and `config.json` (PKCE callback) generated at
-    deploy time — never edited directly
-  - Polls `GET /jobs` every 5 s while any job is pending
-  - Calls `POST /register` on every login; blocks access with a styled
-    alert and signs the user out if the 100-user cap is full
-  - Folder filter, status filter, and keyword search with cookie persistence
-  - Multi-select checkboxes with bulk delete and bulk move-to-folder
-  - Token usage ring in header; color turns red at 80% of the cap
-  - Inline job detail modal with score ring, attachments, notes, and
-    accordion sections for analysis, job description, and resume snapshot
-
-## Function App API Endpoints
-
-All endpoints require `Authorization: Bearer <JWT>` issued by Entra External ID.
-CORS is restricted to the web storage static website origin.
-
-### Registration & Usage
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/api/register` | Register user; enforces 100-user cap |
-| GET | `/api/usage` | Return per-user AOAI token consumption |
-
-### Resumes
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/api/resumes` | Upload a new resume |
-| GET | `/api/resumes` | List all resumes for the authenticated user |
-| GET | `/api/resumes/{resume_id}` | Retrieve a resume with full text |
-| PUT | `/api/resumes/{resume_id}` | Replace a resume name and text |
-| DELETE | `/api/resumes/{resume_id}` | Delete a resume and its blob |
-
-### Jobs
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/api/jobs` | Submit a job for scoring (URL, raw text, or LinkedIn ID) |
-| GET | `/api/jobs` | List all jobs (includes `folder_id`, `attachment_count`) |
-| GET | `/api/jobs/{job_id}` | Retrieve a job with score, analysis, and attachments |
-| PATCH | `/api/jobs/{job_id}/notes` | Update user notes on a job |
-| PATCH | `/api/jobs/{job_id}/folder` | Move job to a folder (or clear with `null`) |
-| DELETE | `/api/jobs/{job_id}` | Delete a job and all associated blobs |
-
-### Attachments
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/jobs/{job_id}/attachments` | List attachments for a job |
-| POST | `/api/jobs/{job_id}/attachments` | Upload an attachment (base64 JSON, max 5 files / 10 MB each) |
-| GET | `/api/jobs/{job_id}/attachments/{att_id}` | Download attachment as base64 JSON |
-| DELETE | `/api/jobs/{job_id}/attachments/{att_id}` | Delete an attachment |
-
-### Folders
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/folders` | List all folders for the authenticated user |
-| POST | `/api/folders` | Create a new folder |
-| DELETE | `/api/folders/{folder_id}` | Delete a folder and unassign its jobs |
-
-### Request & Response Characteristics
-
-| Aspect | Behavior |
-|--------|----------|
-| Authentication | Entra External ID JWT (Bearer) |
-| Authorization | Enforced via Cosmos DB document `owner` field |
-| Identity Source | JWT `sub` claim |
-| Content Type | `application/json` |
-| Timestamps | ISO 8601 strings |
-| Error Handling | Standard HTTP status codes with `{"error": "..."}` body |
-
----
-
-### POST /api/resumes
-
-**Purpose:** Upload a resume for use in job scoring.
-
-**Request Body (JSON):**
-```json
-{
-  "name": "Software Engineer Resume",
-  "resume": "Full resume text goes here..."
-}
-```
-
-**Example Response (200):**
-```json
-{
-  "resume_id": "a1b2c3d4-1234-5678-abcd-ef1234567890",
-  "name": "My Resume"
-}
-```
-
----
-
-### POST /api/jobs
-
-**Purpose:** Submit a job posting for AI scoring. Returns immediately with
-`submitted` status while scoring runs asynchronously via Service Bus.
-
-**Request Body (JSON) — URL source:**
-```json
-{
-  "resume_id": "a1b2c3d4-...",
-  "source_type": "url",
-  "job_url": "https://www.linkedin.com/jobs/view/1234567890"
-}
-```
-
-**Request Body (JSON) — Raw text source:**
-```json
-{
-  "resume_id": "a1b2c3d4-...",
-  "source_type": "raw_text",
-  "job_description": "We are looking for a Senior Python Engineer..."
-}
-```
-
-**Example Response (200):**
-```json
-{
-  "job_id": "b2c3d4e5-1234-5678-abcd-ef1234567890",
-  "status": "submitted",
-  "status_message": "Job submitted for scoring"
-}
-```
-
-Returns `429 Too Many Requests` if the user has exceeded the 100 K AOAI token
-limit.
-
-**Job Status Values:**
-
-| Status | Meaning |
-|--------|---------|
-| `submitted` | Job queued, worker not yet started |
-| `Scoring` | Worker is actively processing |
-| `Scored` | Scoring complete, results available |
-| `Failed` | Processing failed, see `status_message` |
-
----
-
-### GET /api/jobs/{job_id}
-
-**Purpose:** Retrieve a scored job with full analysis. Poll this endpoint
-after submission until `status` is `Scored` or `Failed`.
-
-**Example Response (200):**
-```json
-{
-  "job_id": "b2c3d4e5-...",
-  "job_title": "Senior Python Engineer",
-  "company": "Acme Corp",
-  "status": "Scored",
-  "score": 78,
-  "folder_id": "abc123",
-  "job_analysis": "Overview: ...\n\nStrengths: ...\n\nWeaknesses: ...",
-  "job_description": "We are looking for...",
-  "resume_snapshot": "John Smith...",
-  "attachments": [{"att_id": "def456", "filename": "offer.pdf", "size": 42000}],
-  "notes": "",
-  "created_at": "2025-05-04T12:30:00Z",
-  "updated_at": "2025-05-04T12:30:35Z"
-}
-```
-
----
-
-## Changing the Azure OpenAI Model
-
-The model deployment name is parameterized end-to-end. To retarget, edit the
-`export` line in [aoai-config.sh](aoai-config.sh) — sourced by both `apply.sh`
-and `destroy.sh`:
-
-```bash
-export AOAI_MODEL_DEPLOYMENT="gpt-4o"
-```
-
-This value flows automatically to:
-
-- **`01-backend/` Terraform** — provisions the cognitive deployment with this
-  name and version
-- **`02-functions/` Terraform** — sets the `AOAI_MODEL_DEPLOYMENT` app setting
-  on the Function App
-- **`02-functions/code/function_app.py`** — reads `AOAI_MODEL_DEPLOYMENT` at
-  runtime and passes it to the Azure OpenAI SDK
-
-If the new model uses a different response schema, also update the prompt
-strings in [02-functions/code/function_app.py](02-functions/code/function_app.py).
-
-## Destroy
+## Teardown
 
 ```bash
 ./destroy.sh
 ```
 
-Tears down all infrastructure provisioned by `apply.sh`. The destroy script:
+## Notes
 
-1. Reads all outputs from `01-backend` Terraform state
-2. Destroys `03-webapp` (removes blobs from `$web` container)
-3. Destroys `02-functions` (Function App, RBAC assignments)
-4. Removes the Entra app association from the user flow via Graph API
-5. Destroys `01-backend` (Service Bus, Cosmos DB, Storage, AOAI, Entra app)
-
-## Using the Application
-
-Once deployed, open the **App URL** printed by `validate.sh` in your browser.
-
-### 1. Sign In
-
-Click **Sign In**. You are redirected to the **Entra External ID hosted sign-in
-page**. On first use, choose **Sign Up**, enter your email address and a
-password, then complete email verification if required.
-
-After sign-in you are redirected back to the dashboard via `callback.html`,
-which completes the PKCE code exchange and stores the id_token in sessionStorage.
-The app immediately calls `POST /register` to verify or create your user record.
-If the 100-user cap is full, a dialog is shown and you are signed out.
-
-### 2. Add a Resume
-
-Before scoring any jobs you need at least one resume on file.
-
-1. Click the **document icon** in the header to open **Manage Resumes**.
-2. Click **New Resume**, give it a name (e.g. `Software Engineer Resume`), and
-   paste the full plain-text content of your resume into the text area.
-3. Click **Create Resume**. The resume text is stored in Blob Storage and the
-   metadata in Cosmos DB.
-
-You can create multiple resumes (e.g. one tailored for backend roles, one for
-management) and choose between them at scoring time.
-
-### 3. Organize with Folders
-
-Use folders to group jobs by role type, company, or any category.
-
-1. Click the **folder+ icon** next to the folder filter to create a folder.
-2. Select it from the **folder dropdown** in the filter bar to show only those
-   jobs.
-3. Assign a job to a folder from the **new-job form** or via the **job detail
-   modal**.
-4. To delete a folder, select it in the filter bar and click the **folder-
-   delete icon**. Jobs in the folder are unassigned but not deleted.
-
-### 4. Score a Job
-
-1. Click the **+ icon** in the header to open **Score New Job**.
-2. Select the resume to score against from the **Resume** dropdown.
-3. Optionally assign the job to a **Folder**.
-4. Choose a **Source Type**:
-
-   | Source Type | When to use |
-   |-------------|-------------|
-   | **Job URL** | Paste a direct link to any publicly accessible job posting |
-   | **Paste Job Description** | Paste raw job description text — useful when a URL requires login |
-   | **LinkedIn Job IDs** | Enter one or more numeric LinkedIn job IDs (one per line) for batch submission |
-
-5. Click **Submit**. The job is queued in Service Bus and the modal closes.
-
-### 5. Monitor Scoring Progress
-
-While a job is being processed:
-
-- The **Status** badge shows `submitted` or `Scoring`.
-- A **spinner and countdown** appear in the toolbar — the list auto-refreshes
-  every 5 seconds until all pending jobs reach a terminal state.
-- Click the **refresh icon** at any time to poll immediately.
-
-Scoring typically takes **20–90 seconds** depending on Azure OpenAI response
-time and whether the job URL requires fetching and HTML parsing.
-
-### 6. View the Analysis
-
-Once the status changes to **Scored**, click the **job title** to open the
-inline detail modal:
-
-- **Score ring** — color-coded compatibility rating (green ≥ 75, amber ≥ 50,
-  red < 50)
-- **Analysis** — Overview, Strengths, and Weaknesses sections generated by
-  GPT-4o
-- **Job Description** — the cleaned job text used for scoring
-- **Resume Snapshot** — the version of your resume captured at submission time
-  (edits to the resume afterwards do not affect past scores)
-- **Notes** — personal annotations saved in Blob Storage
-
-### 7. Attach Files
-
-In the job detail modal, use the **Attachments** section to upload supporting
-documents (offer letters, recruiter emails, etc.):
-
-- Up to **5 attachments** per job, **10 MB** each
-- Files are stored in Blob Storage and transferred as base64 JSON
-- Click the **paperclip icon** on any row in the dashboard for quick download
-  access without opening the full modal
-
-### 8. Filter and Search
-
-The **filter bar** below the header provides three independent filters that
-stack multiplicatively:
-
-| Filter | What it narrows |
-|--------|-----------------|
-| **Folder** | Show only jobs in the selected folder (or all) |
-| **Status** | Show only jobs with a specific scoring status |
-| **Search** | Keyword match on job title and company name |
-
-Filter state is saved in cookies and restored on next page load.
-
-### 9. Bulk Operations
-
-Select multiple jobs using the **checkboxes** in the leftmost column (or the
-master checkbox in the header):
-
-- **Bulk Delete** — removes all selected jobs and their blobs permanently
-- **Bulk Move** — reassigns all selected jobs to the chosen folder
-
-### 10. Token Usage
-
-The **token ring** in the filter bar shows your cumulative AOAI token
-consumption. The ring turns red at 80% of your 100 K limit. When the limit
-is reached, new job submissions return a `429 Too Many Requests` error.
-
-### 11. Delete Jobs
-
-Open the job detail modal and use the delete action, or select jobs via
-checkboxes and use **Bulk Delete**. Deletion removes the Cosmos DB record and
-all associated blobs. This action cannot be undone.
+- **Lab only.** Anyone can sign up through the user flow, up to the
+  100-user cap.
+- Nothing expires on its own: the Cosmos DB containers have TTL enabled but
+  no items set one, and the media account has no lifecycle rules.
+  `JOB_RETENTION_DAYS = 90` in `function_app.py` isn't used.
+- Because a failed job is redelivered, a job that fails after one model call
+  can be charged for more tokens than it used once.
+- The token check verifies the signature, audience and expiry, but not the
+  issuer.
